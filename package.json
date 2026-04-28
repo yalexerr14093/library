@@ -1,0 +1,19 @@
+{
+  "name": "biblioteka",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Library management system — MVC",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "verify:dev": "node scripts/verify-dev.mjs",
+    "purge:no-cover": "cd backend && npm run purge:no-cover",
+    "backfill:trends-week": "cd backend && npm run backfill:trends-week",
+    "install:all": "npm install && cd backend && npm install && cd ../frontend && npm install",
+    "build": "cd frontend && npm run build"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

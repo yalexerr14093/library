@@ -1,0 +1,12 @@
+.toast {
+  position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);
+  background: var(--ink); color: var(--paper);
+  padding: 13px 22px; border-radius: 9px; font-size: .86rem; z-index: 500;
+  animation: fadeUp .3s ease; box-shadow: var(--shadow-lg);
+  display: flex; align-items: center; gap: 9px;
+  min-width: 260px; max-width: 420px;
+}
+.icon { font-size: .9rem; }
+.s .icon { color: #4caf50; }
+.e .icon { color: #ef5350; }
+.i .icon { color: var(--gold-l); }

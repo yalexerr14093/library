@@ -1,0 +1,182 @@
+.card {
+  position: relative;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: transform 0.22s, box-shadow 0.22s, border-color 0.22s;
+  animation: fadeUp 0.4s ease both;
+  aspect-ratio: 2 / 3; /* пропорции обложки (можно изменить) */
+}
+.card:hover {
+  transform: translateY(-5px);
+  box-shadow: var(--shadow-lg);
+  border-color: var(--gold);
+}
+
+/* Контейнер обложки */
+.cover {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, var(--cream) 0%, var(--gold-pale) 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.coverImg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover; /* обложка заполняет весь блок */
+  display: block;
+}
+.coverEmoji {
+  font-size: 3.8rem;
+  line-height: 1;
+}
+
+/* Бейджи */
+.badge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  padding: 3px 9px;
+  border-radius: 14px;
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  z-index: 2;
+}
+.bbOk   { background: var(--forest-l); color: var(--forest); }
+.bbTaken{ background: #fde8d0; color: var(--rust); }
+.bbMine { background: var(--forest); color: white; }
+.donationBadge {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  background: var(--gold-pale);
+  border: 1px solid var(--gold-l);
+  color: var(--gold);
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  z-index: 2;
+}
+
+/* Кнопка избранного и год */
+.topActions {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  z-index: 2;
+}
+.year {
+  font-size: 0.73rem;
+  color: white;
+  background: rgba(0, 0, 0, 0.5);
+  padding: 2px 6px;
+  border-radius: 10px;
+  backdrop-filter: blur(2px);
+}
+.wishBtn {
+  background: rgba(255, 255, 255, 0.9);
+  border: none;
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  font-size: 1.1rem;
+  cursor: pointer;
+  transition: transform 0.2s, background 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+}
+.wishBtn:hover {
+  transform: scale(1.2);
+  background: white;
+}
+.wishBtn.wishlisted {
+  color: #e25555;
+}
+.wishBtn.wishlisted:hover {
+  color: #c03b3b;
+}
+
+/* Нижняя панель */
+.infoPanel {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(8px);
+  color: white;
+  padding: 12px;
+  transform: translateY(calc(100% - 40px)); /* видна только полоска с названием */
+  transition: transform 0.3s ease;
+  z-index: 3;
+}
+.card:hover .infoPanel {
+  transform: translateY(0); /* при наведении панель поднимается */
+}
+
+.title {
+  font-family: var(--serif);
+  font-size: 1rem;
+  font-weight: 500;
+  line-height: 1.3;
+  margin-bottom: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.moreInfo {
+  opacity: 0;
+  transition: opacity 0.2s 0.1s;
+}
+.card:hover .moreInfo {
+  opacity: 1;
+}
+
+.author {
+  font-size: 0.8rem;
+  color: rgba(255,255,255,0.8);
+  margin-bottom: 4px;
+}
+.genre {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--gold-l);
+  margin-bottom: 6px;
+}
+.rating {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.stars {
+  color: var(--gold);
+  font-size: 0.75rem;
+}
+.ratingCount {
+  font-size: 0.7rem;
+  color: rgba(255,255,255,0.6);
+}
+.description {
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: rgba(255,255,255,0.9);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}

@@ -1,0 +1,2968 @@
+
+
+============================================================
+ФАЙЛ: .\backend\db.js
+============================================================
+
+// backend/db.js
+const { Pool } = require('pg');
+require('dotenv').config();
+
+const pool = new Pool({
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+});
+
+// Проверка подключения
+pool.on('connect', () => console.log('✅ PostgreSQL connected'));
+pool.on('error', (err) => console.error('Unexpected PostgreSQL error', err));
+
+// Инициализация схемы (миграции) и сиды
+async function initDb() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Создание таблиц
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id            SERIAL PRIMARY KEY,
+        name          TEXT NOT NULL,
+        email         TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS books (
+        id            SERIAL PRIMARY KEY,
+        title         TEXT NOT NULL,
+        author        TEXT NOT NULL,
+        genre         TEXT NOT NULL,
+        year          INTEGER,
+        cover_emoji   TEXT DEFAULT '📖',
+        description   TEXT,
+        available     BOOLEAN DEFAULT TRUE,
+        donated_by    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        is_donation   BOOLEAN DEFAULT FALSE,
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS rentals (
+        id          SERIAL PRIMARY KEY,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        book_id     INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        rented_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        due_date    TIMESTAMP NOT NULL,
+        returned    BOOLEAN DEFAULT FALSE,
+        returned_at TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reviews (
+        id          SERIAL PRIMARY KEY,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        book_id     INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        rating      INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+        comment     TEXT,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, book_id)
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS wishlist (
+        id          SERIAL PRIMARY KEY,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        book_id     INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        added_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, book_id)
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reservations (
+        id          SERIAL PRIMARY KEY,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        book_id     INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        reserved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        notified    BOOLEAN DEFAULT FALSE,
+        cancelled   BOOLEAN DEFAULT FALSE,
+        UNIQUE(user_id, book_id)
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS donations (
+        id          SERIAL PRIMARY KEY,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title       TEXT NOT NULL,
+        author      TEXT NOT NULL,
+        genre       TEXT NOT NULL,
+        year        INTEGER,
+        description TEXT,
+        status      TEXT DEFAULT 'pending',
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Seed (проверяем, есть ли книги)
+    const { rows } = await client.query('SELECT COUNT(*) as c FROM books');
+    if (parseInt(rows[0].c) === 0) {
+      const seedBooks = [
+        ["Мастер и Маргарита",       "Михаил Булгаков",    "Роман",   1967, "🔮", "Сатирический роман о визите Воланда в советскую Москву."],
+        ["Преступление и наказание", "Фёдор Достоевский",  "Классика",1866, "⚖️", "История студента, решившегося на убийство."],
+        // ... остальные книги (как в исходном db.js)
+        ["Герой нашего времени",     "Михаил Лермонтов",   "Роман",   1840, "🗡️", "Психологический портрет «лишнего человека»."],
+      ];
+      for (const b of seedBooks) {
+        await client.query(
+          `INSERT INTO books (title, author, genre, year, cover_emoji, description)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          b
+        );
+      }
+      console.log("✅ DB seeded");
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Migration failed:', err);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { pool, initDb };
+
+============================================================
+ФАЙЛ: .\backend\server.js
+============================================================
+
+// server.js — entry point
+const { initDb } = require("./db");
+const express = require("express");
+const cors = require("cors");
+const routes = require("./routes/index");
+require("dotenv").config();
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:5173", credentials: true }));
+app.use(express.json());
+
+app.use("/api", routes);
+
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: "Внутренняя ошибка сервера" });
+});
+
+// Инициализация БД и запуск сервера
+initDb()
+  .then(() => {
+    app.listen(PORT, () => console.log(`📚 Biblioteka API → http://localhost:${PORT}`));
+  })
+  .catch(err => {
+    console.error("Failed to initialize database:", err);
+    process.exit(1);
+  });
+
+============================================================
+ФАЙЛ: .\backend\controllers\AuthController.js
+============================================================
+
+// controllers/AuthController.js
+const bcrypt = require("bcryptjs");
+const jwt    = require("jsonwebtoken");
+const UserModel = require("../models/UserModel");
+
+const JWT_SECRET  = process.env.JWT_SECRET || "biblioteka-secret-key";
+const JWT_EXPIRES = "7d";
+
+function signToken(user) {
+  return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: JWT_EXPIRES });
+}
+
+const AuthController = {
+  async register(req, res) {
+    const { name, email, password } = req.body;
+    if (!name?.trim() || !email || !password)
+      return res.status(400).json({ error: "Все поля обязательны" });
+    if (password.length < 6)
+      return res.status(400).json({ error: "Пароль минимум 6 символов" });
+    if (UserModel.findByEmail(email))
+      return res.status(409).json({ error: "Email уже зарегистрирован" });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = UserModel.create({ name: name.trim(), email, passwordHash });
+    res.status(201).json({ token: signToken(user), user });
+  },
+
+  async login(req, res) {
+    const { email, password } = req.body;
+    const user = UserModel.findByEmail(email);
+    if (!user) return res.status(401).json({ error: "Неверный email или пароль" });
+
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.status(401).json({ error: "Неверный email или пароль" });
+
+    const { password_hash, ...safeUser } = user;
+    res.json({ token: signToken(safeUser), user: safeUser });
+  },
+
+  me(req, res) {
+    const user = UserModel.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: "Не найден" });
+    const stats = UserModel.getStats(req.user.id);
+    res.json({ ...user, stats });
+  },
+};
+
+module.exports = AuthController;
+
+
+============================================================
+ФАЙЛ: .\backend\controllers\BookController.js
+============================================================
+
+// controllers/BookController.js
+const BookModel = require("../models/BookModel");
+const { ReviewModel } = require("../models/index");
+
+const BookController = {
+  async list(req, res) {
+    try {
+      const { search = "", genre = "" } = req.query;
+      const books = await BookModel.findAll({ search, genre });
+      res.json(books);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка получения списка книг" });
+    }
+  },
+
+  async detail(req, res) {
+    try {
+      const book = await BookModel.findById(req.params.id);
+      if (!book) return res.status(404).json({ error: "Книга не найдена" });
+      const reviews = await ReviewModel.findByBook(book.id);
+      res.json({ ...book, reviews });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка получения книги" });
+    }
+  },
+
+  async genres(req, res) {
+    try {
+      const genres = await BookModel.getGenres();
+      res.json(genres);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка получения жанров" });
+    }
+  },
+};
+
+module.exports = BookController;
+
+============================================================
+ФАЙЛ: .\backend\controllers\index.js
+============================================================
+
+// controllers/index.js
+const { pool } = require("../db");
+const { ReviewModel, WishlistModel, ReservationModel, DonationModel } = require("../models/index");
+const RentalModel = require("../models/RentalModel");
+const BookModel = require("../models/BookModel");
+
+const ReviewController = {
+  async forBook(req, res) {
+    try {
+      const reviews = await ReviewModel.findByBook(req.params.bookId);
+      res.json(reviews);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка получения отзывов" });
+    }
+  },
+
+  async upsert(req, res) {
+    try {
+      const { rating, comment = "" } = req.body;
+      const bookId = parseInt(req.params.bookId);
+      if (!rating || rating < 1 || rating > 5)
+        return res.status(400).json({ error: "Оценка от 1 до 5" });
+
+      const hasReturned = await RentalModel.hasReturned(req.user.id, bookId);
+      if (!hasReturned)
+        return res.status(403).json({ error: "Оставить отзыв можно только после возврата книги" });
+
+      const review = await ReviewModel.upsert(req.user.id, bookId, rating, comment.trim());
+      res.status(201).json(review);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка сохранения отзыва" });
+    }
+  },
+};
+
+const WishlistController = {
+  async list(req, res) {
+    try {
+      const items = await WishlistModel.findByUser(req.user.id);
+      res.json(items);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка получения избранного" });
+    }
+  },
+
+  async toggle(req, res) {
+    try {
+      const bookId = parseInt(req.params.bookId);
+      const existing = await WishlistModel.findEntry(req.user.id, bookId);
+      if (existing) {
+        await WishlistModel.remove(req.user.id, bookId);
+        res.json({ wishlisted: false });
+      } else {
+        await WishlistModel.add(req.user.id, bookId);
+        res.json({ wishlisted: true });
+      }
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка изменения избранного" });
+    }
+  },
+
+  async check(req, res) {
+    try {
+      const entry = await WishlistModel.findEntry(req.user.id, parseInt(req.params.bookId));
+      res.json({ wishlisted: !!entry });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка проверки избранного" });
+    }
+  },
+};
+
+const ReservationController = {
+  async myReservations(req, res) {
+    try {
+      const items = await ReservationModel.findByUser(req.user.id);
+      res.json(items);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка получения броней" });
+    }
+  },
+
+  async reserve(req, res) {
+    try {
+      const bookId = parseInt(req.params.bookId);
+      const book = await BookModel.findById(bookId);
+      if (!book) return res.status(404).json({ error: "Книга не найдена" });
+      if (book.available)
+        return res.status(400).json({ error: "Книга уже доступна, возьмите её прямо сейчас" });
+
+      const existing = await ReservationModel.findByUserAndBook(req.user.id, bookId);
+      if (existing) return res.status(409).json({ error: "Вы уже в очереди" });
+
+      await ReservationModel.create(req.user.id, bookId);
+      const queue = await ReservationModel.findQueueForBook(bookId);
+      res.status(201).json({ position: queue.length, message: "Вы в очереди" });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка при бронировании" });
+    }
+  },
+
+  async cancel(req, res) {
+    try {
+      await ReservationModel.cancel(req.user.id, parseInt(req.params.bookId));
+      res.json({ message: "Бронирование отменено" });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка отмены брони" });
+    }
+  },
+
+  async queueForBook(req, res) {
+    try {
+      const queue = await ReservationModel.findQueueForBook(parseInt(req.params.bookId));
+      res.json(queue);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка получения очереди" });
+    }
+  },
+};
+
+const DonationController = {
+  async myDonations(req, res) {
+    try {
+      const donations = await DonationModel.findByUser(req.user.id);
+      res.json(donations);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка получения пожертвований" });
+    }
+  },
+
+  async submit(req, res) {
+    const { title, author, genre, year, description } = req.body;
+    if (!title?.trim() || !author?.trim() || !genre?.trim())
+      return res.status(400).json({ error: "Название, автор и жанр обязательны" });
+
+    const EMOJI_MAP = {
+      Роман: "📗",
+      Классика: "📘",
+      Эпопея: "🏛️",
+      Поэзия: "🎶",
+      Сатира: "😄",
+      Пьеса: "🎭",
+      Поэма: "📜",
+    };
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const don = await DonationModel.create({
+        userId: req.user.id,
+        title: title.trim(),
+        author: author.trim(),
+        genre,
+        year,
+        description,
+      });
+
+      await DonationModel.approve(don.id);
+
+      const book = await BookModel.create({
+        title: title.trim(),
+        author: author.trim(),
+        genre,
+        year: year || null,
+        coverEmoji: EMOJI_MAP[genre] || "📚",
+        description: description?.trim() || "",
+        donatedBy: req.user.id,
+        isDonation: 1,
+      });
+
+      await client.query("COMMIT");
+      res.status(201).json({ donation: don, book });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error(err);
+      res.status(500).json({ error: "Ошибка при добавлении пожертвования" });
+    } finally {
+      client.release();
+    }
+  },
+};
+
+module.exports = { ReviewController, WishlistController, ReservationController, DonationController };
+
+============================================================
+ФАЙЛ: .\backend\controllers\RentalController.js
+============================================================
+
+// controllers/RentalController.js
+const { pool } = require("../db");
+const BookModel = require("../models/BookModel");
+const RentalModel = require("../models/RentalModel");
+const { ReservationModel } = require("../models/index");
+
+const RentalController = {
+  async myRentals(req, res) {
+    try {
+      const rentals = await RentalModel.findAllByUser(req.user.id);
+      res.json(rentals);
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка получения аренд" });
+    }
+  },
+
+  async rent(req, res) {
+    const { book_id } = req.body;
+    if (!book_id) return res.status(400).json({ error: "book_id обязателен" });
+
+    try {
+      const book = await BookModel.findById(book_id);
+      if (!book) return res.status(404).json({ error: "Книга не найдена" });
+      if (!book.available) return res.status(409).json({ error: "Книга уже арендована" });
+
+      const existing = await RentalModel.findActiveByUserAndBook(req.user.id, book_id);
+      if (existing) return res.status(409).json({ error: "Вы уже арендовали эту книгу" });
+
+      const dueDate = new Date();
+      dueDate.setDate(dueDate.getDate() + 14);
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const rentalId = await RentalModel.create(req.user.id, book_id, dueDate.toISOString());
+        await BookModel.setAvailable(book_id, false);
+        await client.query('COMMIT');
+        res.status(201).json({ id: rentalId, due_date: dueDate });
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка при аренде" });
+    }
+  },
+
+  async returnBook(req, res) {
+    try {
+      const rental = await RentalModel.findById(req.params.id);
+      if (!rental || rental.user_id !== req.user.id)
+        return res.status(404).json({ error: "Аренда не найдена" });
+      if (rental.returned) return res.status(409).json({ error: "Уже возвращена" });
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await RentalModel.markReturned(rental.id);
+        await BookModel.setAvailable(rental.book_id, true);
+        await ReservationModel.notifyFirst(rental.book_id);
+        await client.query('COMMIT');
+        res.json({ message: "Книга успешно возвращена" });
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ error: "Ошибка при возврате" });
+    }
+  },
+};
+
+module.exports = RentalController;
+
+============================================================
+ФАЙЛ: .\backend\middleware\authMiddleware.js
+============================================================
+
+// middleware/authMiddleware.js
+const jwt = require("jsonwebtoken");
+const JWT_SECRET = process.env.JWT_SECRET || "biblioteka-secret-key";
+
+module.exports = function authMiddleware(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith("Bearer "))
+    return res.status(401).json({ error: "Требуется авторизация" });
+  try {
+    req.user = jwt.verify(header.split(" ")[1], JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: "Недействительный токен" });
+  }
+};
+
+
+============================================================
+ФАЙЛ: .\backend\models\BookModel.js
+============================================================
+
+// models/BookModel.js
+const { pool } = require("../db");
+
+class BookModel {
+  static async findAll({ search = "", genre = "" } = {}) {
+    let sql = `
+      SELECT b.*,
+        ROUND(AVG(r.rating), 1) as avg_rating,
+        COUNT(r.id) as review_count
+      FROM books b
+      LEFT JOIN reviews r ON r.book_id = b.id
+      WHERE 1=1
+    `;
+    const params = [];
+    if (search) {
+      sql += " AND (b.title ILIKE $1 OR b.author ILIKE $2)";
+      params.push(`%${search}%`, `%${search}%`);
+    }
+    if (genre && genre !== 'Все') {
+      sql += ` AND b.genre = $${params.length + 1}`;
+      params.push(genre);
+    }
+    sql += " GROUP BY b.id ORDER BY b.title";
+    const { rows } = await pool.query(sql, params);
+    return rows;
+  }
+
+  static async findById(id) {
+    const { rows } = await pool.query(
+      `SELECT b.*,
+        ROUND(AVG(r.rating), 1) as avg_rating,
+        COUNT(r.id) as review_count
+      FROM books b
+      LEFT JOIN reviews r ON r.book_id = b.id
+      WHERE b.id = $1
+      GROUP BY b.id`,
+      [id]
+    );
+    return rows[0] || null;
+  }
+
+  static async create({ title, author, genre, year, coverEmoji = "📖", description = "", donatedBy = null, isDonation = 0 }) {
+    const { rows } = await pool.query(
+      `INSERT INTO books (title, author, genre, year, cover_emoji, description, donated_by, is_donation)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [title, author, genre, year, coverEmoji, description, donatedBy, isDonation]
+    );
+    return rows[0];
+  }
+
+  static async setAvailable(id, available) {
+    await pool.query(
+      "UPDATE books SET available = $1 WHERE id = $2",
+      [available, id]
+    );
+  }
+
+  static async getGenres() {
+    const { rows } = await pool.query("SELECT DISTINCT genre FROM books ORDER BY genre");
+    return rows.map(r => r.genre);
+  }
+}
+
+module.exports = BookModel;
+
+============================================================
+ФАЙЛ: .\backend\models\index.js
+============================================================
+
+// models/index.js
+const { pool } = require("../db");
+
+// ---------- ReviewModel ----------
+const ReviewModel = {
+  async findByBook(bookId) {
+    const { rows } = await pool.query(
+      `SELECT rv.*, u.name as user_name
+      FROM reviews rv JOIN users u ON rv.user_id = u.id
+      WHERE rv.book_id = $1
+      ORDER BY rv.created_at DESC`,
+      [bookId]
+    );
+    return rows;
+  },
+
+  async findByUserAndBook(userId, bookId) {
+    const { rows } = await pool.query(
+      "SELECT * FROM reviews WHERE user_id = $1 AND book_id = $2",
+      [userId, bookId]
+    );
+    return rows[0];
+  },
+
+  async upsert(userId, bookId, rating, comment) {
+    const existing = await this.findByUserAndBook(userId, bookId);
+    if (existing) {
+      await pool.query(
+        "UPDATE reviews SET rating = $1, comment = $2 WHERE user_id = $3 AND book_id = $4",
+        [rating, comment, userId, bookId]
+      );
+    } else {
+      await pool.query(
+        "INSERT INTO reviews (user_id, book_id, rating, comment) VALUES ($1, $2, $3, $4)",
+        [userId, bookId, rating, comment]
+      );
+    }
+    return this.findByUserAndBook(userId, bookId);
+  },
+};
+
+// ---------- WishlistModel ----------
+const WishlistModel = {
+  async findByUser(userId) {
+    const { rows } = await pool.query(
+      `SELECT w.*, b.title, b.author, b.genre, b.cover_emoji, b.available,
+        ROUND(AVG(r.rating), 1) as avg_rating
+      FROM wishlist w
+      JOIN books b ON w.book_id = b.id
+      LEFT JOIN reviews r ON r.book_id = b.id
+      WHERE w.user_id = $1
+      GROUP BY w.id, b.id
+      ORDER BY w.added_at DESC`,
+      [userId]
+    );
+    return rows;
+  },
+
+  async findEntry(userId, bookId) {
+    const { rows } = await pool.query(
+      "SELECT * FROM wishlist WHERE user_id = $1 AND book_id = $2",
+      [userId, bookId]
+    );
+    return rows[0];
+  },
+
+  async add(userId, bookId) {
+    try {
+      await pool.query(
+        "INSERT INTO wishlist (user_id, book_id) VALUES ($1, $2)",
+        [userId, bookId]
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  async remove(userId, bookId) {
+    await pool.query(
+      "DELETE FROM wishlist WHERE user_id = $1 AND book_id = $2",
+      [userId, bookId]
+    );
+  },
+};
+
+// ---------- ReservationModel ----------
+const ReservationModel = {
+  async findByUserAndBook(userId, bookId) {
+    const { rows } = await pool.query(
+      "SELECT * FROM reservations WHERE user_id = $1 AND book_id = $2 AND cancelled = FALSE",
+      [userId, bookId]
+    );
+    return rows[0];
+  },
+
+  async findQueueForBook(bookId) {
+    const { rows } = await pool.query(
+      `SELECT rs.*, u.name as user_name, u.email
+      FROM reservations rs JOIN users u ON rs.user_id = u.id
+      WHERE rs.book_id = $1 AND rs.cancelled = FALSE
+      ORDER BY rs.reserved_at ASC`,
+      [bookId]
+    );
+    return rows;
+  },
+
+  async findByUser(userId) {
+    const { rows } = await pool.query(
+      `SELECT rs.*, b.title, b.author, b.cover_emoji
+      FROM reservations rs JOIN books b ON rs.book_id = b.id
+      WHERE rs.user_id = $1 AND rs.cancelled = FALSE
+      ORDER BY rs.reserved_at DESC`,
+      [userId]
+    );
+    return rows;
+  },
+
+  async create(userId, bookId) {
+    const { rows } = await pool.query(
+      "INSERT INTO reservations (user_id, book_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id",
+      [userId, bookId]
+    );
+    return rows[0]?.id;
+  },
+
+  async cancel(userId, bookId) {
+    await pool.query(
+      "UPDATE reservations SET cancelled = TRUE WHERE user_id = $1 AND book_id = $2",
+      [userId, bookId]
+    );
+  },
+
+  async notifyFirst(bookId) {
+    const { rows } = await pool.query(
+      `SELECT * FROM reservations 
+       WHERE book_id = $1 AND cancelled = FALSE AND notified = FALSE 
+       ORDER BY reserved_at ASC LIMIT 1`,
+      [bookId]
+    );
+    if (rows[0]) {
+      await pool.query(
+        "UPDATE reservations SET notified = TRUE WHERE id = $1",
+        [rows[0].id]
+      );
+      return rows[0];
+    }
+    return null;
+  },
+};
+
+// ---------- DonationModel ----------
+const DonationModel = {
+  async findByUser(userId) {
+    const { rows } = await pool.query(
+      "SELECT * FROM donations WHERE user_id = $1 ORDER BY created_at DESC",
+      [userId]
+    );
+    return rows;
+  },
+
+  async findById(id) {
+    const { rows } = await pool.query("SELECT * FROM donations WHERE id = $1", [id]);
+    return rows[0];
+  },
+
+  async create({ userId, title, author, genre, year, description }) {
+    const { rows } = await pool.query(
+      `INSERT INTO donations (user_id, title, author, genre, year, description) 
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [userId, title, author, genre, year || null, description || ""]
+    );
+    return rows[0];
+  },
+
+  async approve(id) {
+    await pool.query(
+      "UPDATE donations SET status = 'approved' WHERE id = $1",
+      [id]
+    );
+    return this.findById(id);
+  },
+};
+
+module.exports = { ReviewModel, WishlistModel, ReservationModel, DonationModel };
+
+============================================================
+ФАЙЛ: .\backend\models\RentalModel.js
+============================================================
+
+// models/RentalModel.js
+const { pool } = require("../db");
+
+class RentalModel {
+  static async findActiveByUser(userId) {
+    const { rows } = await pool.query(
+      `SELECT r.*, b.title, b.author, b.genre, b.cover_emoji, b.year
+      FROM rentals r JOIN books b ON r.book_id = b.id
+      WHERE r.user_id = $1 AND r.returned = FALSE
+      ORDER BY r.rented_at DESC`,
+      [userId]
+    );
+    return rows;
+  }
+
+  static async findAllByUser(userId) {
+    const { rows } = await pool.query(
+      `SELECT r.*, b.title, b.author, b.genre, b.cover_emoji, b.year
+      FROM rentals r JOIN books b ON r.book_id = b.id
+      WHERE r.user_id = $1
+      ORDER BY r.rented_at DESC`,
+      [userId]
+    );
+    return rows;
+  }
+
+  static async findActiveByUserAndBook(userId, bookId) {
+    const { rows } = await pool.query(
+      "SELECT * FROM rentals WHERE user_id = $1 AND book_id = $2 AND returned = FALSE",
+      [userId, bookId]
+    );
+    return rows[0];
+  }
+
+  static async findById(id) {
+    const { rows } = await pool.query("SELECT * FROM rentals WHERE id = $1", [id]);
+    return rows[0];
+  }
+
+  static async create(userId, bookId, dueDate) {
+    const { rows } = await pool.query(
+      "INSERT INTO rentals (user_id, book_id, due_date) VALUES ($1, $2, $3) RETURNING id",
+      [userId, bookId, dueDate]
+    );
+    return rows[0].id;
+  }
+
+  static async markReturned(id) {
+    await pool.query(
+      "UPDATE rentals SET returned = TRUE, returned_at = CURRENT_TIMESTAMP WHERE id = $1",
+      [id]
+    );
+  }
+
+  static async hasReturned(userId, bookId) {
+    const { rows } = await pool.query(
+      "SELECT id FROM rentals WHERE user_id = $1 AND book_id = $2 AND returned = TRUE",
+      [userId, bookId]
+    );
+    return rows.length > 0;
+  }
+}
+
+module.exports = RentalModel;
+
+============================================================
+ФАЙЛ: .\backend\models\UserModel.js
+============================================================
+
+// models/UserModel.js
+const { pool } = require("../db");
+
+class UserModel {
+  static async findByEmail(email) {
+    const { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    return rows[0];
+  }
+
+  static async findById(id) {
+    const { rows } = await pool.query(
+      "SELECT id, name, email, created_at FROM users WHERE id = $1",
+      [id]
+    );
+    return rows[0];
+  }
+
+  static async create({ name, email, passwordHash }) {
+    const { rows } = await pool.query(
+      "INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email, created_at",
+      [name, email, passwordHash]
+    );
+    return rows[0];
+  }
+
+  static async getStats(userId) {
+    const [active, returned, reviews, donated, wishlisted] = await Promise.all([
+      pool.query("SELECT COUNT(*) as c FROM rentals WHERE user_id = $1 AND returned = FALSE", [userId]),
+      pool.query("SELECT COUNT(*) as c FROM rentals WHERE user_id = $1 AND returned = TRUE", [userId]),
+      pool.query("SELECT COUNT(*) as c FROM reviews WHERE user_id = $1", [userId]),
+      pool.query("SELECT COUNT(*) as c FROM donations WHERE user_id = $1 AND status = 'approved'", [userId]),
+      pool.query("SELECT COUNT(*) as c FROM wishlist WHERE user_id = $1", [userId]),
+    ]);
+    return {
+      active: parseInt(active.rows[0].c),
+      returned: parseInt(returned.rows[0].c),
+      reviews: parseInt(reviews.rows[0].c),
+      donated: parseInt(donated.rows[0].c),
+      wishlisted: parseInt(wishlisted.rows[0].c),
+    };
+  }
+}
+
+module.exports = UserModel;
+
+============================================================
+ФАЙЛ: .\backend\routes\index.js
+============================================================
+
+// routes/index.js — all route definitions
+const router = require("express").Router();
+const auth   = require("../middleware/authMiddleware");
+
+const AuthController    = require("../controllers/AuthController");
+const BookController    = require("../controllers/BookController");
+const RentalController  = require("../controllers/RentalController");
+const { ReviewController, WishlistController, ReservationController, DonationController } = require("../controllers/index");
+
+// ── Auth ─────────────────────────────────────────────────────────────────────
+router.post  ("/auth/register",    AuthController.register);
+router.post  ("/auth/login",       AuthController.login);
+router.get   ("/auth/me",    auth, AuthController.me);
+
+// ── Books ────────────────────────────────────────────────────────────────────
+router.get   ("/books",            BookController.list);
+router.get   ("/books/genres",     BookController.genres);
+router.get   ("/books/:id",        BookController.detail);
+
+// ── Rentals ──────────────────────────────────────────────────────────────────
+router.get   ("/rentals/my",  auth, RentalController.myRentals);
+router.post  ("/rentals",     auth, RentalController.rent);
+router.patch ("/rentals/:id/return", auth, RentalController.returnBook);
+
+// ── Reviews ──────────────────────────────────────────────────────────────────
+router.get   ("/reviews/:bookId",       BookController.detail);   // included in detail
+router.post  ("/reviews/:bookId", auth, ReviewController.upsert);
+router.get   ("/reviews/book/:bookId",  ReviewController.forBook);
+
+// ── Wishlist ─────────────────────────────────────────────────────────────────
+router.get   ("/wishlist",              auth, WishlistController.list);
+router.post  ("/wishlist/:bookId/toggle", auth, WishlistController.toggle);
+router.get   ("/wishlist/:bookId/check",  auth, WishlistController.check);
+
+// ── Reservations ─────────────────────────────────────────────────────────────
+router.get   ("/reservations/my",            auth, ReservationController.myReservations);
+router.post  ("/reservations/:bookId",       auth, ReservationController.reserve);
+router.delete("/reservations/:bookId",       auth, ReservationController.cancel);
+router.get   ("/reservations/:bookId/queue",      ReservationController.queueForBook);
+
+// ── Donations (Bookcrossing) ──────────────────────────────────────────────────
+router.get   ("/donations/my",  auth, DonationController.myDonations);
+router.post  ("/donations",     auth, DonationController.submit);
+
+module.exports = router;
+
+
+============================================================
+ФАЙЛ: .\frontend\index.html
+============================================================
+
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Biblioteka — городская библиотека онлайн" />
+    <title>Biblioteka</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+
+============================================================
+ФАЙЛ: .\frontend\vite.config.js
+============================================================
+
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    proxy: {
+      // Proxy all /api requests to Express backend
+      '/api': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+      },
+    },
+  },
+})
+
+
+============================================================
+ФАЙЛ: .\frontend\src\App.jsx
+============================================================
+
+import { Routes, Route, Navigate } from 'react-router-dom'
+import { AuthProvider } from './context/AuthContext.jsx'
+import { ToastProvider } from './context/ToastContext.jsx'
+import Navbar from './components/Navbar.jsx'
+import Toast from './components/Toast.jsx'
+import CatalogPage from './pages/CatalogPage.jsx'
+import MyBooksPage from './pages/MyBooksPage.jsx'
+import WishlistPage from './pages/WishlistPage.jsx'
+import ProfilePage from './pages/ProfilePage.jsx'
+import ProtectedRoute from './components/ProtectedRoute.jsx'
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <ToastProvider>
+        <Navbar />
+        <Toast />
+        <Routes>
+          <Route path="/"          element={<CatalogPage />} />
+          <Route path="/catalog"   element={<Navigate to="/" replace />} />
+          <Route path="/my-books"  element={<ProtectedRoute><MyBooksPage /></ProtectedRoute>} />
+          <Route path="/wishlist"  element={<ProtectedRoute><WishlistPage /></ProtectedRoute>} />
+          <Route path="/profile"   element={<ProtectedRoute><ProfilePage /></ProtectedRoute>} />
+          <Route path="*"          element={<Navigate to="/" replace />} />
+        </Routes>
+      </ToastProvider>
+    </AuthProvider>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\index.css
+============================================================
+
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,700;1,400;1,500&family=DM+Sans:wght@300;400;500;600&display=swap');
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --ink: #12100e;
+  --paper: #faf8f3;
+  --cream: #f4f0e6;
+  --gold: #b8860b;
+  --gold-l: #e8d5a3;
+  --gold-pale: #fdf8ec;
+  --rust: #8b3a1a;
+  --rust-l: #c4622a;
+  --forest: #1e3a2f;
+  --forest-l: #e6f0eb;
+  --sky: #1a3a5c;
+  --sky-l: #e6eef8;
+  --border: #ddd8cc;
+  --muted: #7a7060;
+  --serif: 'Playfair Display', Georgia, serif;
+  --sans: 'DM Sans', system-ui, sans-serif;
+  --shadow: 0 2px 12px rgba(18, 16, 14, 0.08);
+  --shadow-lg: 0 8px 32px rgba(18, 16, 14, 0.14);
+  --radius: 10px;
+  --radius-lg: 16px;
+}
+
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--sans);
+  background: var(--paper);
+  color: var(--ink);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  font-family: var(--sans);
+}
+
+input, textarea, select {
+  font-family: var(--sans);
+}
+
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: var(--cream); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes scaleIn {
+  from { opacity: 0; transform: scale(0.93); }
+  to   { opacity: 1; transform: scale(1); }
+}
+@keyframes slideRight {
+  from { opacity: 0; transform: translateX(-14px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\main.jsx
+============================================================
+
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import App from './App.jsx'
+import './index.css'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>,
+)
+
+
+============================================================
+ФАЙЛ: .\frontend\src\api\authApi.js
+============================================================
+
+import { get, post } from './client.js'
+
+export const authApi = {
+  register: ({ name, email, password }) =>
+    post('/auth/register', { name, email, password }),
+
+  login: ({ email, password }) =>
+    post('/auth/login', { email, password }),
+
+  me: (token) =>
+    get('/auth/me', token),
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\api\booksApi.js
+============================================================
+
+import { get } from './client.js'
+
+export const booksApi = {
+  list: ({ search = '', genre = '' } = {}) => {
+    const params = new URLSearchParams()
+    if (search) params.set('search', search)
+    if (genre)  params.set('genre', genre)
+    const qs = params.toString()
+    return get(`/books${qs ? '?' + qs : ''}`)
+  },
+
+  detail: (id) => get(`/books/${id}`),
+
+  genres: () => get('/books/genres'),
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\api\client.js
+============================================================
+
+const BASE = import.meta.env.VITE_API_URL ?? '/api'
+
+async function request(path, { method = 'GET', body, token } = {}) {
+  const headers = { 'Content-Type': 'application/json' }
+  if (token) headers['Authorization'] = `Bearer ${token}`
+
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  })
+
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`)
+  return data
+}
+
+export const get    = (path, token)        => request(path, { token })
+export const post   = (path, body, token)  => request(path, { method: 'POST',   body, token })
+export const patch  = (path, body, token)  => request(path, { method: 'PATCH',  body, token })
+export const del    = (path, token)        => request(path, { method: 'DELETE', token })
+
+
+============================================================
+ФАЙЛ: .\frontend\src\api\donationsApi.js
+============================================================
+
+import { get, post } from './client.js'
+
+export const donationsApi = {
+  myDonations: (token) => get('/donations/my', token),
+
+  submit: ({ title, author, genre, year, description }, token) =>
+    post('/donations', { title, author, genre, year, description }, token),
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\api\rentalsApi.js
+============================================================
+
+import { get, post, patch } from './client.js'
+
+export const rentalsApi = {
+  myRentals: (token) => get('/rentals/my', token),
+
+  rent: (bookId, token) => post('/rentals', { book_id: bookId }, token),
+
+  returnBook: (rentalId, token) => patch(`/rentals/${rentalId}/return`, {}, token),
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\api\reservationsApi.js
+============================================================
+
+import { get, post, del } from './client.js'
+
+export const reservationsApi = {
+  myReservations: (token) => get('/reservations/my', token),
+
+  reserve: (bookId, token) => post(`/reservations/${bookId}`, {}, token),
+
+  cancel: (bookId, token) => del(`/reservations/${bookId}`, token),
+
+  queueForBook: (bookId) => get(`/reservations/${bookId}/queue`),
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\api\reviewsApi.js
+============================================================
+
+import { get, post } from './client.js'
+
+export const reviewsApi = {
+  forBook: (bookId) => get(`/reviews/book/${bookId}`),
+
+  upsert: (bookId, { rating, comment }, token) =>
+    post(`/reviews/${bookId}`, { rating, comment }, token),
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\api\wishlistApi.js
+============================================================
+
+import { get, post } from './client.js'
+
+export const wishlistApi = {
+  list: (token) => get('/wishlist', token),
+
+  toggle: (bookId, token) => post(`/wishlist/${bookId}/toggle`, {}, token),
+
+  check: (bookId, token) => get(`/wishlist/${bookId}/check`, token),
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\AuthModal.jsx
+============================================================
+
+import { useState } from 'react'
+import Modal from './Modal.jsx'
+import { useAuth } from '../context/AuthContext.jsx'
+import { useToast } from '../context/ToastContext.jsx'
+import styles from './AuthModal.module.css'
+
+export default function AuthModal({ initialMode = 'login', onClose }) {
+  const { login, register } = useAuth()
+  const { showToast }       = useToast()
+  const [mode, setMode]     = useState(initialMode)
+  const [form, setForm]     = useState({ name: '', email: '', password: '' })
+  const [error, setError]   = useState('')
+  const [loading, setLoading] = useState(false)
+
+  const set = (k) => (e) => setForm((p) => ({ ...p, [k]: e.target.value }))
+
+  const handleSubmit = async () => {
+    setError('')
+    setLoading(true)
+    try {
+      if (mode === 'register') {
+        if (!form.name.trim())       return setError('Введите имя')
+        if (!form.email.includes('@')) return setError('Некорректный email')
+        if (form.password.length < 6) return setError('Пароль минимум 6 символов')
+        const u = await register(form)
+        showToast(`Добро пожаловать, ${u.name}! 📚`)
+      } else {
+        const u = await login(form)
+        showToast(`С возвращением, ${u.name}!`)
+      }
+      onClose()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const onKey = (e) => e.key === 'Enter' && handleSubmit()
+
+  return (
+    <Modal onClose={onClose} maxWidth={460}>
+      <h2 className={styles.title}>{mode === 'login' ? 'Добро пожаловать' : 'Регистрация'}</h2>
+      <p className={styles.sub}>{mode === 'login' ? 'Войдите в аккаунт' : 'Создайте аккаунт читателя'}</p>
+
+      {mode === 'register' && (
+        <div className={styles.fg}>
+          <label className={styles.label}>Имя</label>
+          <input className={styles.input} placeholder="Ваше имя" value={form.name} onChange={set('name')} onKeyDown={onKey} />
+        </div>
+      )}
+      <div className={styles.fg}>
+        <label className={styles.label}>Email</label>
+        <input className={styles.input} type="email" placeholder="you@email.com" value={form.email} onChange={set('email')} onKeyDown={onKey} />
+      </div>
+      <div className={styles.fg}>
+        <label className={styles.label}>Пароль</label>
+        <input className={styles.input} type="password" placeholder={mode === 'register' ? 'Минимум 6 символов' : 'Ваш пароль'} value={form.password} onChange={set('password')} onKeyDown={onKey} />
+      </div>
+
+      {error && <div className={styles.error}>⚠ {error}</div>}
+
+      <button className={`${styles.btn} ${styles.btnPrimary}`} onClick={handleSubmit} disabled={loading}>
+        {loading ? 'Загрузка…' : mode === 'login' ? 'Войти' : 'Создать аккаунт'}
+      </button>
+
+      <div className={styles.switch}>
+        {mode === 'login'
+          ? <>Нет аккаунта? <button onClick={() => { setMode('register'); setError('') }}>Зарегистрироваться</button></>
+          : <>Уже есть аккаунт? <button onClick={() => { setMode('login'); setError('') }}>Войти</button></>
+        }
+      </div>
+    </Modal>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\AuthModal.module.css
+============================================================
+
+.title  { font-family: var(--serif); font-size: 1.8rem; font-weight: 400; margin-bottom: 6px; }
+.sub    { color: var(--muted); font-size: .87rem; margin-bottom: 26px; line-height: 1.6; }
+.fg     { margin-bottom: 16px; }
+.label  { display: block; font-size: .74rem; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+.input  {
+  width: 100%; padding: 10px 13px; border: 1px solid var(--border); border-radius: 7px;
+  font-size: .9rem; color: var(--ink); background: white; transition: border-color .2s;
+}
+.input:focus { outline: none; border-color: var(--gold); box-shadow: 0 0 0 3px rgba(184,134,11,.1); }
+.error  { color: #c0392b; font-size: .79rem; margin-bottom: 12px; }
+.btn    {
+  width: 100%; padding: 13px; border-radius: 7px; border: none;
+  font-size: .9rem; font-weight: 500; cursor: pointer; transition: all .2s; letter-spacing: .03em;
+}
+.btnPrimary { background: var(--ink); color: var(--paper); margin-top: 8px; }
+.btnPrimary:hover { background: #2a2520; }
+.btnPrimary:disabled { opacity: .5; cursor: not-allowed; }
+.switch { text-align: center; margin-top: 18px; font-size: .84rem; color: var(--muted); }
+.switch button { background: none; border: none; color: var(--rust); cursor: pointer; font-weight: 600; text-decoration: underline; font-size: .84rem; }
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\BookCard.jsx
+============================================================
+
+import { useAuth } from '../context/AuthContext.jsx'
+import { avgRating } from '../utils/dateUtils.js'
+import styles from './BookCard.module.css'
+
+export default function BookCard({ book, reviews = [], isWishlisted, onOpen, onToggleWish }) {
+  const { user } = useAuth()
+  const avg = avgRating(reviews.filter(r => r.book_id === book.id))
+
+  const statusLabel = book.is_mine ? 'У вас' : book.available ? 'Свободна' : 'Занята'
+  const statusClass = book.is_mine ? styles.bbMine : book.available ? styles.bbOk : styles.bbTaken
+
+  return (
+    <div className={styles.card} onClick={() => onOpen(book)}>
+      <div className={styles.cover}>
+        <span>{book.cover_emoji}</span>
+        <span className={`${styles.badge} ${statusClass}`}>{statusLabel}</span>
+        {book.is_donation && <span className={styles.donationBadge}>📦 дар читателя</span>}
+      </div>
+
+      <div className={styles.body}>
+        <div className={styles.genre}>{book.genre}</div>
+        <div className={styles.title}>{book.title}</div>
+        <div className={styles.author}>{book.author}</div>
+
+        {avg && (
+          <div className={styles.rating}>
+            <span className={styles.stars}>{'★'.repeat(Math.round(avg))}</span>
+            <span className={styles.ratingText}>{avg} ({reviews.filter(r => r.book_id === book.id).length})</span>
+          </div>
+        )}
+
+        <div className={styles.desc}>{book.description}</div>
+      </div>
+
+      <div className={styles.foot}>
+        <span className={styles.year}>{book.year}</span>
+        {user && (
+          <button
+            className={`${styles.wishBtn} ${isWishlisted ? styles.wishlisted : ''}`}
+            onClick={(e) => { e.stopPropagation(); onToggleWish(book.id) }}
+            title={isWishlisted ? 'Убрать из избранного' : 'В избранное'}
+          >
+            {isWishlisted ? '❤️' : '🤍'}
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\BookCard.module.css
+============================================================
+
+.card {
+  background: white; border: 1px solid var(--border); border-radius: 12px;
+  overflow: hidden; cursor: pointer;
+  transition: transform .22s, box-shadow .22s, border-color .22s;
+  animation: fadeUp .4s ease both;
+}
+.card:hover { transform: translateY(-5px); box-shadow: var(--shadow-lg); border-color: var(--gold); }
+
+.cover {
+  height: 170px; display: flex; align-items: center; justify-content: center;
+  font-size: 3.8rem; position: relative;
+  background: linear-gradient(135deg, var(--cream) 0%, var(--gold-pale) 100%);
+}
+.badge {
+  position: absolute; top: 10px; right: 10px;
+  padding: 3px 9px; border-radius: 14px; font-size: .66rem; font-weight: 700; letter-spacing: .05em;
+}
+.bbOk   { background: var(--forest-l); color: var(--forest); }
+.bbTaken{ background: #fde8d0; color: var(--rust); }
+.bbMine { background: var(--forest); color: white; }
+.donationBadge {
+  position: absolute; bottom: 10px; left: 10px;
+  background: var(--gold-pale); border: 1px solid var(--gold-l); color: var(--gold);
+  padding: 2px 8px; border-radius: 10px; font-size: .62rem; font-weight: 700; letter-spacing: .06em;
+}
+
+.body  { padding: 16px; }
+.genre { font-size: .66rem; letter-spacing: .14em; text-transform: uppercase; color: var(--rust); margin-bottom: 5px; font-weight: 600; }
+.title { font-family: var(--serif); font-size: 1.12rem; font-weight: 500; line-height: 1.25; margin-bottom: 3px; }
+.author{ font-size: .8rem; color: var(--muted); margin-bottom: 10px; }
+.rating{ display: flex; align-items: center; gap: 5px; font-size: .78rem; margin-bottom: 8px; }
+.stars { color: var(--gold); letter-spacing: 1px; font-size: .75rem; }
+.ratingText { font-size: .75rem; color: var(--muted); }
+.desc  { font-size: .81rem; color: var(--muted); line-height: 1.55; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+.foot  { padding: 11px 16px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+.year  { font-size: .73rem; color: var(--muted); }
+.wishBtn { background: none; border: none; cursor: pointer; font-size: 1.1rem; transition: transform .2s; padding: 2px 6px; border-radius: 6px; }
+.wishBtn:hover { transform: scale(1.2); }
+.wishBtn.wishlisted { animation: pop .3s ease; }
+
+@keyframes pop { 0% { transform:scale(1) } 50% { transform:scale(1.22) } 100% { transform:scale(1) } }
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\BookModal.jsx
+============================================================
+
+import { useState } from 'react'
+import Modal from './Modal.jsx'
+import StarPicker from './StarPicker.jsx'
+import { useAuth } from '../context/AuthContext.jsx'
+import { useToast } from '../context/ToastContext.jsx'
+import { rentalsApi } from '../api/rentalsApi.js'
+import { reviewsApi } from '../api/reviewsApi.js'
+import { wishlistApi } from '../api/wishlistApi.js'
+import { reservationsApi } from '../api/reservationsApi.js'
+import { fmtDate, daysLeft, starsStr, avgRating } from '../utils/dateUtils.js'
+import styles from './BookModal.module.css'
+
+export default function BookModal({ book, rentals, reviews, wishlist, reservations, onClose, onRefresh, onAuthRequired }) {
+  const { user, token }   = useAuth()
+  const { showToast }     = useToast()
+  const [rating, setRating]       = useState(0)
+  const [comment, setComment]     = useState('')
+  const [loading, setLoading]     = useState(false)
+
+  const activeRental   = rentals.find(r => r.book_id === book.id && !r.returned)
+  const bookReviews    = reviews.filter(r => r.book_id === book.id)
+  const isWishlisted   = wishlist.some(w => w.book_id === book.id)
+  const myReservation  = reservations.find(r => r.book_id === book.id)
+  const queueLen       = reservations.filter(r => r.book_id === book.id).length
+  const canReview      = rentals.some(r => r.book_id === book.id && r.returned)
+  const myReview       = reviews.find(r => r.book_id === book.id && r.user_id === user?.id)
+  const avg            = avgRating(bookReviews)
+  const left           = activeRental ? daysLeft(activeRental.due_date) : null
+
+  // Pre-fill existing review
+  useState(() => {
+    if (myReview) { setRating(myReview.rating); setComment(myReview.comment || '') }
+  }, [myReview])
+
+  const withAuth = (fn) => () => user ? fn() : onAuthRequired()
+
+  const handleRent = withAuth(async () => {
+    setLoading(true)
+    try {
+      await rentalsApi.rent(book.id, token)
+      showToast(`«${book.title}» арендована на 14 дней 📖`)
+      onRefresh(); onClose()
+    } catch (e) { showToast(e.message, 'e') }
+    finally { setLoading(false) }
+  })
+
+  const handleReturn = async () => {
+    setLoading(true)
+    try {
+      await rentalsApi.returnBook(activeRental.id, token)
+      showToast(`«${book.title}» возвращена. Спасибо! ✨`, 'i')
+      onRefresh(); onClose()
+    } catch (e) { showToast(e.message, 'e') }
+    finally { setLoading(false) }
+  }
+
+  const handleReserve = withAuth(async () => {
+    try {
+      const res = await reservationsApi.reserve(book.id, token)
+      showToast(`Вы ${res.position}-й в очереди 🔔`)
+      onRefresh()
+    } catch (e) { showToast(e.message, 'e') }
+  })
+
+  const handleCancelReservation = async () => {
+    try {
+      await reservationsApi.cancel(book.id, token)
+      showToast('Бронь отменена', 'i'); onRefresh()
+    } catch (e) { showToast(e.message, 'e') }
+  }
+
+  const handleToggleWish = withAuth(async () => {
+    try {
+      const res = await wishlistApi.toggle(book.id, token)
+      showToast(res.wishlisted ? 'Добавлено в избранное 🔖' : 'Удалено из избранного', 'i')
+      onRefresh()
+    } catch (e) { showToast(e.message, 'e') }
+  })
+
+  const handleReview = async () => {
+    if (!rating) return showToast('Выберите оценку', 'e')
+    try {
+      await reviewsApi.upsert(book.id, { rating, comment }, token)
+      showToast('Отзыв сохранён ⭐')
+      onRefresh()
+    } catch (e) { showToast(e.message, 'e') }
+  }
+
+  return (
+    <Modal onClose={onClose} maxWidth={560}>
+      {/* Header */}
+      <div className={styles.header}>
+        <div className={styles.cover}>{book.cover_emoji}</div>
+        <div className={styles.info}>
+          <h2 className={styles.title}>{book.title}</h2>
+          <div className={styles.author}>{book.author} · {book.year}</div>
+          <div className={styles.tags}>
+            <span className={styles.tag}>{book.genre}</span>
+            {book.is_donation && <span className={`${styles.tag} ${styles.donTag}`}>📦 Буккроссинг</span>}
+            {avg && <span className={`${styles.tag} ${styles.ratingTag}`}>★ {avg}</span>}
+          </div>
+          <button className={styles.wishInline} onClick={handleToggleWish}>
+            {isWishlisted ? '❤️ В избранном' : '🤍 В избранное'}
+          </button>
+        </div>
+      </div>
+
+      <p className={styles.desc}>{book.description}</p>
+
+      {/* Active rental info */}
+      {activeRental && (
+        <div className={`${styles.rentalBox} ${left > 5 ? styles.rbGreen : styles.rbWarn}`}>
+          <p>📅 Вернуть до: <strong>{fmtDate(activeRental.due_date)}</strong></p>
+          <p>{left > 0 ? `⏳ Осталось ${left} дн.` : '⚠️ Срок аренды истёк'}</p>
+        </div>
+      )}
+
+      {/* CTA */}
+      {activeRental ? (
+        <button className={`${styles.btn} ${styles.btnForest}`} onClick={handleReturn} disabled={loading}>
+          ↩ Вернуть книгу
+        </button>
+      ) : book.available ? (
+        <button className={`${styles.btn} ${styles.btnRust}`} onClick={handleRent} disabled={loading}>
+          📖 Арендовать на 14 дней
+        </button>
+      ) : (
+        <div className={styles.unavailable}>
+          <button className={`${styles.btn} ${styles.btnDisabled}`} disabled>Книга сейчас занята</button>
+          {user && (myReservation
+            ? <div className={styles.queuePill}>🔔 Вы в очереди · позиция {queueLen}
+                <button className={styles.cancelRes} onClick={handleCancelReservation}>Отменить</button>
+              </div>
+            : <button className={`${styles.btn} ${styles.btnSky}`} onClick={handleReserve}>
+                🔔 Встать в очередь {queueLen > 0 && `(${queueLen} ждут)`}
+              </button>
+          )}
+        </div>
+      )}
+
+      {/* Reviews list */}
+      {bookReviews.length > 0 && (
+        <div className={styles.reviewsSection}>
+          <div className={styles.divider} />
+          <div className={styles.reviewsTitle}>
+            Отзывы читателей {avg && <span className={styles.avgBadge}>★ {avg} ({bookReviews.length})</span>}
+          </div>
+          {bookReviews.slice(0, 3).map(rv => (
+            <div key={rv.id} className={styles.reviewCard}>
+              <div className={styles.rvHead}>
+                <span className={styles.rvName}>{rv.user_name}</span>
+                <span className={styles.rvStars}>{starsStr(rv.rating)}</span>
+              </div>
+              {rv.comment && <div className={styles.rvText}>{rv.comment}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Leave review */}
+      {user && canReview && (
+        <>
+          <div className={styles.divider} />
+          <div className={styles.reviewFormTitle}>{myReview ? 'Ваш отзыв' : 'Оставить отзыв'}</div>
+          <StarPicker value={rating} onChange={setRating} />
+          <textarea
+            className={styles.textarea}
+            rows={3}
+            placeholder="Ваши впечатления (необязательно)…"
+            value={comment}
+            onChange={(e) => setComment(e.target.value)}
+          />
+          <button className={`${styles.btn} ${styles.btnGold}`} onClick={handleReview}>
+            {myReview ? 'Обновить отзыв' : 'Опубликовать отзыв'}
+          </button>
+        </>
+      )}
+    </Modal>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\BookModal.module.css
+============================================================
+
+.header { display: flex; gap: 22px; margin-bottom: 22px; align-items: flex-start; }
+.cover  { width: 90px; height: 120px; border-radius: 8px; background: linear-gradient(135deg, var(--cream), var(--gold-pale)); display: flex; align-items: center; justify-content: center; font-size: 3.2rem; flex-shrink: 0; }
+.info   { flex: 1; }
+.title  { font-family: var(--serif); font-size: 1.65rem; font-weight: 400; line-height: 1.2; margin-bottom: 5px; }
+.author { color: var(--muted); font-size: .88rem; margin-bottom: 10px; }
+.tags   { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.tag    { padding: 2px 10px; border-radius: 12px; font-size: .7rem; font-weight: 700; letter-spacing: .05em; background: var(--cream); color: var(--rust); }
+.donTag { background: var(--gold-pale); color: var(--gold); }
+.ratingTag { background: #fffbe6; color: var(--gold); }
+.wishInline { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px; font-size: .78rem; cursor: pointer; transition: background .2s; }
+.wishInline:hover { background: var(--cream); }
+
+.desc { font-size: .91rem; line-height: 1.72; color: #3a3530; margin-bottom: 20px; }
+
+.rentalBox { border-radius: 9px; padding: 14px 16px; margin-bottom: 16px; }
+.rentalBox p { font-size: .84rem; line-height: 1.7; }
+.rbGreen { background: var(--forest-l); }
+.rbWarn  { background: #fde8d0; }
+
+.btn { width: 100%; padding: 13px; border-radius: 7px; border: none; font-size: .9rem; font-weight: 500; cursor: pointer; transition: all .2s; letter-spacing: .03em; margin-bottom: 10px; }
+.btnRust   { background: var(--rust);   color: white; } .btnRust:hover   { background: var(--rust-l); }
+.btnForest { background: var(--forest); color: white; } .btnForest:hover { background: #162c23; }
+.btnSky    { background: var(--sky);    color: white; } .btnSky:hover    { background: #122a48; }
+.btnGold   { background: var(--gold);   color: white; } .btnGold:hover   { background: #9a7209; }
+.btnDisabled { background: var(--cream); color: var(--muted); cursor: not-allowed; border: 1px solid var(--border); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+
+.unavailable { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+.queuePill { display: flex; align-items: center; justify-content: center; gap: 12px; background: var(--sky-l); border: 1px solid #b8d0e8; border-radius: 20px; padding: 8px 16px; font-size: .8rem; color: var(--sky); font-weight: 500; }
+.cancelRes { background: none; border: none; color: var(--muted); cursor: pointer; font-size: .78rem; text-decoration: underline; }
+
+.divider { height: 1px; background: var(--border); margin: 20px 0; }
+.reviewsSection {}
+.reviewsTitle { font-family: var(--serif); font-size: 1.05rem; margin-bottom: 12px; }
+.avgBadge { color: var(--gold); font-size: .9rem; margin-left: 8px; }
+.reviewCard { background: var(--cream); border-radius: 9px; padding: 13px; margin-bottom: 9px; }
+.rvHead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
+.rvName { font-weight: 600; font-size: .85rem; }
+.rvStars { color: var(--gold); font-size: .8rem; letter-spacing: 1px; }
+.rvText { font-size: .84rem; color: #4a4540; line-height: 1.6; }
+
+.reviewFormTitle { font-family: var(--serif); font-size: 1rem; margin-bottom: 12px; }
+.textarea { width: 100%; padding: 10px 13px; border: 1px solid var(--border); border-radius: 7px; font-size: .88rem; resize: vertical; margin-bottom: 12px; }
+.textarea:focus { outline: none; border-color: var(--gold); }
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\DonateModal.jsx
+============================================================
+
+import { useState } from 'react'
+import Modal from './Modal.jsx'
+import { useAuth } from '../context/AuthContext.jsx'
+import { useToast } from '../context/ToastContext.jsx'
+import { donationsApi } from '../api/donationsApi.js'
+import { GENRES } from '../utils/bookUtils.js'
+import styles from './DonateModal.module.css'
+
+export default function DonateModal({ onClose, onRefresh }) {
+  const { token }     = useAuth()
+  const { showToast } = useToast()
+  const [form, setForm] = useState({ title: '', author: '', genre: 'Роман', year: '', description: '' })
+  const [loading, setLoading] = useState(false)
+
+  const set = (k) => (e) => setForm((p) => ({ ...p, [k]: e.target.value }))
+
+  const handleSubmit = async () => {
+    if (!form.title.trim() || !form.author.trim())
+      return showToast('Название и автор обязательны', 'e')
+    setLoading(true)
+    try {
+      await donationsApi.submit(form, token)
+      showToast(`«${form.title}» добавлена в каталог! 📦`)
+      onRefresh(); onClose()
+    } catch (e) { showToast(e.message, 'e') }
+    finally { setLoading(false) }
+  }
+
+  return (
+    <Modal onClose={onClose} maxWidth={480}>
+      <h2 className={styles.title}>📦 Буккроссинг</h2>
+      <p className={styles.sub}>Пожертвуйте свою книгу — она появится в каталоге и будет доступна всем читателям.</p>
+
+      <div className={styles.fg}><label className={styles.label}>Название *</label>
+        <input className={styles.input} placeholder="Название книги" value={form.title} onChange={set('title')} />
+      </div>
+      <div className={styles.fg}><label className={styles.label}>Автор *</label>
+        <input className={styles.input} placeholder="Имя автора" value={form.author} onChange={set('author')} />
+      </div>
+      <div className={styles.row}>
+        <div className={styles.fg}><label className={styles.label}>Жанр</label>
+          <select className={`${styles.input} ${styles.select}`} value={form.genre} onChange={set('genre')}>
+            {GENRES.slice(1).map(g => <option key={g}>{g}</option>)}
+          </select>
+        </div>
+        <div className={styles.fg}><label className={styles.label}>Год</label>
+          <input className={styles.input} type="number" placeholder="напр. 1984" value={form.year} onChange={set('year')} />
+        </div>
+      </div>
+      <div className={styles.fg}><label className={styles.label}>Описание</label>
+        <textarea className={`${styles.input} ${styles.textarea}`} rows={3} placeholder="Пару слов о книге…" value={form.description} onChange={set('description')} />
+      </div>
+
+      <button className={styles.submit} onClick={handleSubmit} disabled={loading}>
+        {loading ? 'Добавляем…' : '📦 Пожертвовать в библиотеку'}
+      </button>
+    </Modal>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\DonateModal.module.css
+============================================================
+
+.title  { font-family: var(--serif); font-size: 1.8rem; font-weight: 400; margin-bottom: 6px; }
+.sub    { color: var(--muted); font-size: .87rem; margin-bottom: 24px; line-height: 1.65; }
+.fg     { margin-bottom: 15px; flex: 1; }
+.label  { display: block; font-size: .74rem; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+.input  { width: 100%; padding: 10px 13px; border: 1px solid var(--border); border-radius: 7px; font-size: .9rem; color: var(--ink); background: white; transition: border-color .2s; }
+.input:focus { outline: none; border-color: var(--gold); box-shadow: 0 0 0 3px rgba(184,134,11,.1); }
+.select { appearance: none; }
+.textarea { resize: vertical; }
+.row    { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.submit { width: 100%; padding: 13px; background: var(--gold); color: white; border: none; border-radius: 7px; font-size: .9rem; font-weight: 500; cursor: pointer; transition: background .2s; margin-top: 6px; }
+.submit:hover { background: #9a7209; }
+.submit:disabled { opacity: .5; cursor: not-allowed; }
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\Modal.jsx
+============================================================
+
+import styles from './Modal.module.css'
+
+export default function Modal({ children, onClose, maxWidth = 500 }) {
+  return (
+    <div className={styles.overlay} onClick={(e) => e.target === e.currentTarget && onClose()}>
+      <div className={styles.modal} style={{ maxWidth }}>
+        <button className={styles.close} onClick={onClose}>×</button>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\Modal.module.css
+============================================================
+
+.overlay {
+  position: fixed; inset: 0; background: rgba(18,16,14,.65);
+  backdrop-filter: blur(5px); z-index: 200;
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px; animation: fadeIn .2s ease;
+}
+.modal {
+  background: white; border-radius: var(--radius-lg); padding: 38px;
+  width: 100%; position: relative; max-height: 92vh; overflow-y: auto;
+  animation: scaleIn .25s ease;
+}
+.close {
+  position: absolute; top: 14px; right: 14px;
+  background: none; border: none; font-size: 1.4rem; cursor: pointer;
+  color: var(--muted); width: 32px; height: 32px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center; transition: background .2s;
+}
+.close:hover { background: var(--cream); }
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\Navbar.jsx
+============================================================
+
+import { useNavigate, useLocation } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext.jsx'
+import { useToast } from '../context/ToastContext.jsx'
+import styles from './Navbar.module.css'
+
+export default function Navbar() {
+  const { user, logout } = useAuth()
+  const { showToast }    = useToast()
+  const navigate         = useNavigate()
+  const { pathname }     = useLocation()
+
+  const handleLogout = () => {
+    logout()
+    navigate('/')
+    showToast('Вы вышли из аккаунта', 'i')
+  }
+
+  const link = (to) => ({
+    className: `${styles.nb} ${pathname === to ? styles.act : ''}`,
+    onClick: () => navigate(to),
+  })
+
+  return (
+    <nav className={styles.nav}>
+      <div className={styles.logo} onClick={() => navigate('/')}>
+        Biblio<em>тека</em>
+      </div>
+
+      <div className={styles.links}>
+        <button {...link('/')}>Каталог</button>
+
+        {user && (
+          <>
+            <button {...link('/my-books')}>Мои книги</button>
+            <button {...link('/wishlist')}>Избранное</button>
+            <button {...link('/profile')}>Профиль</button>
+          </>
+        )}
+
+        {user ? (
+          <div className={styles.userArea}>
+            <div className={styles.avatar}>{user.name[0].toUpperCase()}</div>
+            <button className={styles.nb} onClick={handleLogout}>Выйти</button>
+          </div>
+        ) : (
+          <>
+            <button className={styles.nb} onClick={() => navigate('/?modal=login')}>Войти</button>
+            <button className={`${styles.nb} ${styles.cta}`} onClick={() => navigate('/?modal=register')}>
+              Регистрация
+            </button>
+          </>
+        )}
+      </div>
+    </nav>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\Navbar.module.css
+============================================================
+
+.nav {
+  position: sticky; top: 0; z-index: 100;
+  background: var(--ink);
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 48px; height: 62px;
+  border-bottom: 1px solid rgba(255,255,255,.06);
+}
+.logo {
+  font-family: var(--serif); font-size: 1.45rem; font-weight: 700;
+  color: var(--paper); cursor: pointer; letter-spacing: .01em;
+}
+.logo em { color: var(--gold-l); font-style: italic; }
+.links { display: flex; align-items: center; gap: 4px; }
+.nb {
+  background: none; border: 1px solid transparent;
+  color: rgba(255,255,255,.55); padding: 7px 14px; border-radius: 5px;
+  cursor: pointer; font-size: .78rem; font-weight: 500;
+  letter-spacing: .06em; text-transform: uppercase; transition: all .2s;
+}
+.nb:hover { color: var(--paper); border-color: rgba(255,255,255,.18); }
+.nb.act  { color: var(--paper); background: rgba(255,255,255,.09); border-color: rgba(255,255,255,.13); }
+.nb.cta  { background: var(--rust); color: var(--paper); border-color: var(--rust); }
+.nb.cta:hover { background: var(--rust-l); }
+.userArea { display: flex; align-items: center; gap: 10px; margin-left: 8px; }
+.avatar {
+  width: 32px; height: 32px; border-radius: 50%; background: var(--rust);
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--serif); font-size: .95rem; color: var(--paper); font-weight: 700;
+}
+@media (max-width: 768px) {
+  .nav { padding: 0 18px; }
+  .nb  { padding: 6px 10px; font-size: .72rem; }
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\ProtectedRoute.jsx
+============================================================
+
+import { Navigate, useLocation } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext.jsx'
+
+export default function ProtectedRoute({ children }) {
+  const { user, loading } = useAuth()
+  const location = useLocation()
+
+  if (loading) return <div style={{ padding: 80, textAlign: 'center', color: 'var(--muted)' }}>Загрузка…</div>
+  if (!user)   return <Navigate to={`/?modal=login&next=${location.pathname}`} replace />
+
+  return children
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\StarPicker.jsx
+============================================================
+
+import { useState } from 'react'
+import styles from './StarPicker.module.css'
+
+const LABELS = ['', 'Ужасно', 'Плохо', 'Нормально', 'Хорошо', 'Отлично']
+
+export default function StarPicker({ value, onChange }) {
+  const [hover, setHover] = useState(0)
+  const active = hover || value
+
+  return (
+    <div className={styles.row}>
+      {[1, 2, 3, 4, 5].map((n) => (
+        <button
+          key={n}
+          className={styles.star}
+          style={{ filter: n <= active ? 'none' : 'grayscale(1) opacity(.3)' }}
+          onMouseEnter={() => setHover(n)}
+          onMouseLeave={() => setHover(0)}
+          onClick={() => onChange(n)}
+        >★</button>
+      ))}
+      {active > 0 && <span className={styles.label}>{LABELS[active]}</span>}
+    </div>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\StarPicker.module.css
+============================================================
+
+.row   { display: flex; align-items: center; gap: 4px; margin-bottom: 14px; }
+.star  { background: none; border: none; font-size: 1.6rem; cursor: pointer; transition: transform .15s; line-height: 1; padding: 0 2px; }
+.star:hover { transform: scale(1.15); }
+.label { font-size: .83rem; color: var(--muted); margin-left: 6px; }
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\Toast.jsx
+============================================================
+
+import { useToast } from '../context/ToastContext.jsx'
+import styles from './Toast.module.css'
+
+export default function Toast() {
+  const { toast } = useToast()
+  if (!toast) return null
+
+  const icons = { s: '✓', e: '✕', i: 'ℹ' }
+  return (
+    <div className={`${styles.toast} ${styles[toast.type]}`}>
+      <span className={styles.icon}>{icons[toast.type]}</span>
+      {toast.msg}
+    </div>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\components\Toast.module.css
+============================================================
+
+.toast {
+  position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);
+  background: var(--ink); color: var(--paper);
+  padding: 13px 22px; border-radius: 9px; font-size: .86rem; z-index: 500;
+  animation: fadeUp .3s ease; box-shadow: var(--shadow-lg);
+  display: flex; align-items: center; gap: 9px;
+  min-width: 260px; max-width: 420px;
+}
+.icon { font-size: .9rem; }
+.s .icon { color: #4caf50; }
+.e .icon { color: #ef5350; }
+.i .icon { color: var(--gold-l); }
+
+
+============================================================
+ФАЙЛ: .\frontend\src\context\AuthContext.jsx
+============================================================
+
+import { createContext, useContext, useState, useEffect, useCallback } from 'react'
+import { authApi } from '../api/authApi.js'
+
+const AuthContext = createContext(null)
+
+export function AuthProvider({ children }) {
+  const [user,    setUser]    = useState(null)
+  const [token,   setToken]   = useState(() => localStorage.getItem('token'))
+  const [loading, setLoading] = useState(true)
+
+  // Restore session on mount
+  useEffect(() => {
+    if (!token) { setLoading(false); return }
+    authApi.me(token)
+      .then(u  => setUser(u))
+      .catch(() => { setToken(null); localStorage.removeItem('token') })
+      .finally(() => setLoading(false))
+  }, []) // eslint-disable-line
+
+  const login = useCallback(async ({ email, password }) => {
+    const { token: t, user: u } = await authApi.login({ email, password })
+    localStorage.setItem('token', t)
+    setToken(t); setUser(u)
+    return u
+  }, [])
+
+  const register = useCallback(async ({ name, email, password }) => {
+    const { token: t, user: u } = await authApi.register({ name, email, password })
+    localStorage.setItem('token', t)
+    setToken(t); setUser(u)
+    return u
+  }, [])
+
+  const logout = useCallback(() => {
+    localStorage.removeItem('token')
+    setToken(null); setUser(null)
+  }, [])
+
+  return (
+    <AuthContext.Provider value={{ user, token, loading, login, register, logout }}>
+      {children}
+    </AuthContext.Provider>
+  )
+}
+
+export const useAuth = () => {
+  const ctx = useContext(AuthContext)
+  if (!ctx) throw new Error('useAuth must be used inside AuthProvider')
+  return ctx
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\context\ToastContext.jsx
+============================================================
+
+import { createContext, useContext, useState, useCallback, useRef } from 'react'
+
+const ToastContext = createContext(null)
+
+export function ToastProvider({ children }) {
+  const [toast, setToast] = useState(null) // { msg, type: 's'|'e'|'i' }
+  const timerRef = useRef(null)
+
+  const showToast = useCallback((msg, type = 's') => {
+    if (timerRef.current) clearTimeout(timerRef.current)
+    setToast({ msg, type })
+    timerRef.current = setTimeout(() => setToast(null), 3200)
+  }, [])
+
+  const hideToast = useCallback(() => setToast(null), [])
+
+  return (
+    <ToastContext.Provider value={{ toast, showToast, hideToast }}>
+      {children}
+    </ToastContext.Provider>
+  )
+}
+
+export const useToast = () => {
+  const ctx = useContext(ToastContext)
+  if (!ctx) throw new Error('useToast must be used inside ToastProvider')
+  return ctx
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\hooks\useBooks.js
+============================================================
+
+import { useState, useEffect, useCallback } from 'react'
+import { booksApi } from '../api/booksApi.js'
+
+export function useBooks({ search = '', genre = '' } = {}) {
+  const [books,   setBooks]   = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error,   setError]   = useState(null)
+
+  const load = useCallback(async () => {
+    setLoading(true); setError(null)
+    try {
+      setBooks(await booksApi.list({ search, genre }))
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }, [search, genre])
+
+  useEffect(() => { load() }, [load])
+
+  return { books, loading, error, reload: load }
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\hooks\useRentals.js
+============================================================
+
+import { useState, useEffect, useCallback } from 'react'
+import { rentalsApi } from '../api/rentalsApi.js'
+import { useAuth } from '../context/AuthContext.jsx'
+
+export function useRentals() {
+  const { token } = useAuth()
+  const [rentals, setRentals] = useState([])
+  const [loading, setLoading] = useState(false)
+
+  const load = useCallback(async () => {
+    if (!token) return
+    setLoading(true)
+    try { setRentals(await rentalsApi.myRentals(token)) }
+    finally { setLoading(false) }
+  }, [token])
+
+  useEffect(() => { load() }, [load])
+
+  const rent = async (bookId) => {
+    const rental = await rentalsApi.rent(bookId, token)
+    await load()
+    return rental
+  }
+
+  const returnBook = async (rentalId) => {
+    await rentalsApi.returnBook(rentalId, token)
+    await load()
+  }
+
+  const active  = rentals.filter(r => !r.returned)
+  const history = rentals.filter(r =>  r.returned)
+
+  return { rentals, active, history, loading, rent, returnBook, reload: load }
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\hooks\useReservations.js
+============================================================
+
+import { useState, useEffect, useCallback } from 'react'
+import { reservationsApi } from '../api/reservationsApi.js'
+import { useAuth } from '../context/AuthContext.jsx'
+
+export function useReservations() {
+  const { token } = useAuth()
+  const [items,   setItems]   = useState([])
+  const [loading, setLoading] = useState(false)
+
+  const load = useCallback(async () => {
+    if (!token) return
+    setLoading(true)
+    try { setItems(await reservationsApi.myReservations(token)) }
+    finally { setLoading(false) }
+  }, [token])
+
+  useEffect(() => { load() }, [load])
+
+  const reserve = async (bookId) => {
+    const res = await reservationsApi.reserve(bookId, token)
+    await load()
+    return res
+  }
+
+  const cancel = async (bookId) => {
+    await reservationsApi.cancel(bookId, token)
+    await load()
+  }
+
+  const isReserved = (bookId) => items.some(r => r.book_id === bookId)
+
+  return { items, loading, reserve, cancel, isReserved, reload: load }
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\hooks\useWishlist.js
+============================================================
+
+import { useState, useEffect, useCallback } from 'react'
+import { wishlistApi } from '../api/wishlistApi.js'
+import { useAuth } from '../context/AuthContext.jsx'
+
+export function useWishlist() {
+  const { token } = useAuth()
+  const [items,   setItems]   = useState([])
+  const [loading, setLoading] = useState(false)
+
+  const load = useCallback(async () => {
+    if (!token) return
+    setLoading(true)
+    try { setItems(await wishlistApi.list(token)) }
+    finally { setLoading(false) }
+  }, [token])
+
+  useEffect(() => { load() }, [load])
+
+  const toggle = async (bookId) => {
+    const res = await wishlistApi.toggle(bookId, token)
+    await load()
+    return res.wishlisted
+  }
+
+  const isWishlisted = (bookId) => items.some(w => w.book_id === bookId)
+
+  return { items, loading, toggle, isWishlisted, reload: load }
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\pages\CatalogPage.jsx
+============================================================
+
+import { useState, useEffect, useCallback } from 'react'
+import { useSearchParams, useNavigate } from 'react-router-dom'
+import { booksApi } from '../api/booksApi.js'
+import { rentalsApi } from '../api/rentalsApi.js'
+import { reviewsApi } from '../api/reviewsApi.js'
+import { wishlistApi } from '../api/wishlistApi.js'
+import { reservationsApi } from '../api/reservationsApi.js'
+import { useAuth } from '../context/AuthContext.jsx'
+import { useToast } from '../context/ToastContext.jsx'
+import BookCard from '../components/BookCard.jsx'
+import BookModal from '../components/BookModal.jsx'
+import AuthModal from '../components/AuthModal.jsx'
+import DonateModal from '../components/DonateModal.jsx'
+import { GENRES } from '../utils/bookUtils.js'
+import styles from './CatalogPage.module.css'
+
+export default function CatalogPage() {
+  const { user, token }   = useAuth()
+  const { showToast }     = useToast()
+  const [searchParams]    = useSearchParams()
+  const navigate          = useNavigate()
+
+  // Data
+  const [books,        setBooks]        = useState([])
+  const [rentals,      setRentals]      = useState([])
+  const [reviews,      setReviews]      = useState([])
+  const [wishlist,     setWishlist]     = useState([])
+  const [reservations, setReservations] = useState([])
+
+  // UI
+  const [search,     setSearch]     = useState('')
+  const [genre,      setGenre]      = useState('Все')
+  const [loading,    setLoading]    = useState(true)
+  const [selBook,    setSelBook]    = useState(null)
+  const [showAuth,   setShowAuth]   = useState(null)  // 'login' | 'register'
+  const [showDonate, setShowDonate] = useState(false)
+
+  // Handle ?modal= query param from ProtectedRoute & Navbar
+  useEffect(() => {
+    const m = searchParams.get('modal')
+    if (m === 'login' || m === 'register') { setShowAuth(m); navigate('/', { replace: true }) }
+  }, [searchParams, navigate])
+
+  const loadBooks = useCallback(async () => {
+    setLoading(true)
+    try {
+      const [b, rev] = await Promise.all([
+        booksApi.list({ search, genre: genre === 'Все' ? '' : genre }),
+        // reviews are lightweight, load all
+        fetch('/api/books').then(r => r.json()).catch(() => []),
+      ])
+      setBooks(b)
+    } finally { setLoading(false) }
+  }, [search, genre])
+
+  const loadUserData = useCallback(async () => {
+    if (!token) return
+    const [r, rev, w, res] = await Promise.all([
+      rentalsApi.myRentals(token),
+      // reviews loaded per-book in BookModal
+      Promise.resolve([]),
+      wishlistApi.list(token),
+      reservationsApi.myReservations(token),
+    ])
+    setRentals(r); setWishlist(w); setReservations(res)
+  }, [token])
+
+  const loadReviewsForVisible = useCallback(async (bookList) => {
+    if (!bookList.length) return
+    // Batch: load reviews for first 12 visible books
+    const rvs = await Promise.all(
+      bookList.slice(0, 12).map(b => reviewsApi.forBook(b.id).catch(() => []))
+    )
+    setReviews(rvs.flat())
+  }, [])
+
+  useEffect(() => { loadBooks() }, [loadBooks])
+  useEffect(() => { loadUserData() }, [loadUserData])
+  useEffect(() => { if (books.length) loadReviewsForVisible(books) }, [books, loadReviewsForVisible])
+
+  const refresh = () => { loadBooks(); loadUserData() }
+
+  const handleToggleWish = async (bookId) => {
+    if (!user) { setShowAuth('login'); return }
+    try {
+      const res = await wishlistApi.toggle(bookId, token)
+      showToast(res.wishlisted ? 'Добавлено в избранное 🔖' : 'Удалено из избранного', 'i')
+      loadUserData()
+    } catch (e) { showToast(e.message, 'e') }
+  }
+
+  const stats = {
+    total: books.length,
+    available: books.filter(b => b.available).length,
+    donated: books.filter(b => b.is_donation).length,
+    readers: 0,
+  }
+
+  return (
+    <div>
+      {/* Hero */}
+      <div className={styles.hero}>
+        <div className={styles.heroInner}>
+          <div className={styles.pill}>✦ Городская библиотека</div>
+          <h1 className={styles.h1}>Читайте больше,<br /><em>думайте глубже</em></h1>
+          <p className={styles.lead}>Арендуйте книги на 14 дней, оставляйте отзывы, делитесь своими книгами через буккроссинг.</p>
+          <div className={styles.stats}>
+            <div><div className={styles.sn}>{stats.total}</div><div className={styles.sl}>Книг в фонде</div></div>
+            <div><div className={styles.sn}>{stats.available}</div><div className={styles.sl}>Доступно</div></div>
+            <div><div className={styles.sn}>{stats.donated}</div><div className={styles.sl}>От читателей</div></div>
+          </div>
+        </div>
+      </div>
+
+      {/* Catalog */}
+      <div className={styles.main}>
+        <div className={styles.filters}>
+          <div className={styles.searchWrap}>
+            <span className={styles.sIcon}>🔍</span>
+            <input className={styles.searchInput} placeholder="Поиск по названию или автору…"
+              value={search} onChange={e => setSearch(e.target.value)} />
+          </div>
+          <div className={styles.genres}>
+            {GENRES.map(g => (
+              <button key={g} className={`${styles.gtab} ${genre === g ? styles.gAct : ''}`}
+                onClick={() => setGenre(g)}>{g}</button>
+            ))}
+          </div>
+          {user && (
+            <button className={styles.donateBtn} onClick={() => setShowDonate(true)}>
+              📦 Пожертвовать книгу
+            </button>
+          )}
+        </div>
+
+        {loading ? (
+          <div className={styles.loading}>Загрузка…</div>
+        ) : books.length === 0 ? (
+          <div className={styles.empty}>
+            <div className={styles.emptyIcon}>📚</div>
+            <h3>Книги не найдены</h3>
+            <p>Попробуйте другой запрос</p>
+          </div>
+        ) : (
+          <div className={styles.grid}>
+            {books.map((book, i) => (
+              <div key={book.id} style={{ animationDelay: `${i * 0.04}s` }}>
+                <BookCard
+                  book={{ ...book, is_mine: rentals.some(r => r.book_id === book.id && !r.returned) }}
+                  reviews={reviews}
+                  isWishlisted={wishlist.some(w => w.book_id === book.id)}
+                  onOpen={(b) => setSelBook(b)}
+                  onToggleWish={handleToggleWish}
+                />
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Modals */}
+      {selBook && (
+        <BookModal
+          book={selBook}
+          rentals={rentals}
+          reviews={reviews}
+          wishlist={wishlist}
+          reservations={reservations}
+          onClose={() => setSelBook(null)}
+          onRefresh={refresh}
+          onAuthRequired={() => { setSelBook(null); setShowAuth('login') }}
+        />
+      )}
+      {showAuth   && <AuthModal initialMode={showAuth} onClose={() => setShowAuth(null)} />}
+      {showDonate && <DonateModal onClose={() => setShowDonate(false)} onRefresh={refresh} />}
+    </div>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\pages\CatalogPage.module.css
+============================================================
+
+.hero { background: var(--ink); padding: 72px 48px 64px; position: relative; overflow: hidden; }
+.hero::after { content: ''; position: absolute; inset: 0; background: radial-gradient(ellipse 60% 80% at 80% 40%, rgba(184,134,11,.12), transparent 65%), radial-gradient(ellipse 50% 60% at 10% 80%, rgba(30,58,47,.35), transparent 60%); pointer-events: none; }
+.heroInner { position: relative; z-index: 1; max-width: 640px; }
+.pill { display: inline-flex; align-items: center; gap: 8px; background: rgba(184,134,11,.15); border: 1px solid rgba(184,134,11,.3); border-radius: 20px; padding: 5px 14px; font-size: .72rem; letter-spacing: .14em; text-transform: uppercase; color: var(--gold-l); margin-bottom: 22px; }
+.h1  { font-family: var(--serif); font-size: clamp(2.6rem, 4.5vw, 3.8rem); font-weight: 400; color: var(--paper); line-height: 1.12; margin-bottom: 18px; }
+.h1 em { color: var(--gold-l); font-style: italic; }
+.lead { color: rgba(255,255,255,.5); font-size: .97rem; line-height: 1.72; max-width: 460px; }
+.stats { display: flex; gap: 44px; margin-top: 40px; padding-top: 32px; border-top: 1px solid rgba(255,255,255,.08); }
+.sn { font-family: var(--serif); font-size: 2rem; font-weight: 500; color: var(--paper); }
+.sl { font-size: .7rem; letter-spacing: .12em; text-transform: uppercase; color: rgba(255,255,255,.38); margin-top: 2px; }
+
+.main { max-width: 1300px; margin: 0 auto; padding: 44px 48px; }
+.filters { display: flex; align-items: center; gap: 14px; margin-bottom: 36px; flex-wrap: wrap; }
+.searchWrap { position: relative; flex: 1; min-width: 220px; max-width: 360px; }
+.sIcon { position: absolute; left: 13px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: .9rem; }
+.searchInput { width: 100%; padding: 10px 14px 10px 40px; border: 1px solid var(--border); border-radius: 7px; background: white; font-size: .9rem; color: var(--ink); transition: border-color .2s; }
+.searchInput:focus { outline: none; border-color: var(--gold); }
+.genres { display: flex; gap: 6px; flex-wrap: wrap; }
+.gtab { padding: 7px 13px; border: 1px solid var(--border); border-radius: 18px; background: white; font-size: .76rem; font-weight: 500; color: var(--muted); cursor: pointer; transition: all .2s; }
+.gtab:hover { border-color: var(--gold); color: var(--gold); }
+.gAct { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+.donateBtn { margin-left: auto; padding: 8px 16px; background: var(--gold); color: white; border: none; border-radius: 7px; font-size: .82rem; font-weight: 500; cursor: pointer; transition: background .2s; }
+.donateBtn:hover { background: #9a7209; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 22px; }
+.loading { text-align: center; padding: 80px; color: var(--muted); font-size: .95rem; }
+.empty { text-align: center; padding: 80px 24px; }
+.emptyIcon { font-size: 3.5rem; margin-bottom: 18px; opacity: .35; }
+.empty h3 { font-family: var(--serif); font-size: 1.5rem; font-weight: 400; margin-bottom: 7px; }
+.empty p { color: var(--muted); font-size: .88rem; }
+@media (max-width: 768px) {
+  .hero { padding: 44px 18px 36px; }
+  .stats { gap: 24px; }
+  .main { padding: 28px 18px; }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\pages\MyBooksPage.jsx
+============================================================
+
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext.jsx'
+import { useToast } from '../context/ToastContext.jsx'
+import { useRentals } from '../hooks/useRentals.js'
+import { useReservations } from '../hooks/useReservations.js'
+import { fmtDate, daysLeft } from '../utils/dateUtils.js'
+import styles from './MyBooksPage.module.css'
+
+const TABS = ['active', 'history', 'queue']
+const TAB_LABELS = { active: 'Активные', history: 'История', queue: 'Очередь' }
+
+export default function MyBooksPage() {
+  const navigate          = useNavigate()
+  const { token }         = useAuth()
+  const { showToast }     = useToast()
+  const [tab, setTab]     = useState('active')
+  const { active, history, returnBook } = useRentals()
+  const { items: queue, cancel: cancelReservation, rent } = useReservations()
+
+  const handleReturn = async (rentalId, title) => {
+    try { await returnBook(rentalId); showToast(`«${title}» возвращена ✨`, 'i') }
+    catch (e) { showToast(e.message, 'e') }
+  }
+
+  const handleCancelRes = async (bookId, title) => {
+    try { await cancelReservation(bookId); showToast(`Бронь на «${title}» отменена`, 'i') }
+    catch (e) { showToast(e.message, 'e') }
+  }
+
+  return (
+    <div className={styles.page}>
+      <div className={styles.head}>
+        <h1 className={styles.title}>Мои книги</h1>
+      </div>
+
+      <div className={styles.tabBar}>
+        {TABS.map(t => (
+          <button key={t} className={`${styles.tab} ${tab === t ? styles.tabAct : ''}`} onClick={() => setTab(t)}>
+            {TAB_LABELS[t]}
+            <span className={styles.tabCount}>
+              {t === 'active' ? active.length : t === 'history' ? history.length : queue.length}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      {/* Active */}
+      {tab === 'active' && (
+        active.length === 0 ? (
+          <div className={styles.empty}>
+            <div>📖</div><h3>Нет активных аренд</h3>
+            <p>Перейдите в каталог и возьмите книгу</p>
+            <button className={styles.emptyBtn} onClick={() => navigate('/')}>В каталог</button>
+          </div>
+        ) : (
+          <div className={styles.list}>
+            {active.map((r, i) => {
+              const left = daysLeft(r.due_date)
+              return (
+                <div className={styles.row} key={r.id} style={{ animationDelay: `${i * .07}s` }}>
+                  <div className={styles.emoji}>{r.cover_emoji}</div>
+                  <div className={styles.info}>
+                    <div className={styles.rTitle}>{r.title}</div>
+                    <div className={styles.rAuthor}>{r.author}</div>
+                    <div className={styles.rDates}>
+                      Взята: <strong>{fmtDate(r.rented_at)}</strong> · Вернуть до: <strong>{fmtDate(r.due_date)}</strong>
+                    </div>
+                  </div>
+                  <span className={`${styles.pill} ${left > 5 ? styles.pillOk : left > 0 ? styles.pillWarn : styles.pillOver}`}>
+                    {left > 0 ? `${left} дн.` : 'Просрочено'}
+                  </span>
+                  <button className={`${styles.btn} ${styles.btnForest}`} onClick={() => handleReturn(r.id, r.title)}>
+                    ↩ Вернуть
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        )
+      )}
+
+      {/* History */}
+      {tab === 'history' && (
+        history.length === 0 ? (
+          <div className={styles.empty}><div>📚</div><h3>История пуста</h3><p>Здесь появятся возвращённые книги</p></div>
+        ) : (
+          <div className={styles.list}>
+            {history.map((r, i) => (
+              <div className={styles.row} key={r.id} style={{ opacity: .82, animationDelay: `${i * .05}s` }}>
+                <div className={styles.emoji}>{r.cover_emoji}</div>
+                <div className={styles.info}>
+                  <div className={styles.rTitle}>{r.title}</div>
+                  <div className={styles.rAuthor}>{r.author}</div>
+                  <div className={styles.rDates}>Возвращена: <strong>{fmtDate(r.returned_at)}</strong></div>
+                </div>
+                <span className={`${styles.pill} ${styles.pillDone}`}>Возвращена ✓</span>
+              </div>
+            ))}
+          </div>
+        )
+      )}
+
+      {/* Queue */}
+      {tab === 'queue' && (
+        queue.length === 0 ? (
+          <div className={styles.empty}><div>🔔</div><h3>Нет активных броней</h3><p>Встаньте в очередь на занятую книгу</p></div>
+        ) : (
+          <div className={styles.list}>
+            {queue.map((r, i) => (
+              <div className={styles.row} key={r.id} style={{ animationDelay: `${i * .06}s` }}>
+                <div className={styles.emoji}>{r.cover_emoji}</div>
+                <div className={styles.info}>
+                  <div className={styles.rTitle}>{r.title}</div>
+                  <div className={styles.rAuthor}>{r.author}</div>
+                  <div className={styles.rDates}>Зарезервировано: <strong>{fmtDate(r.reserved_at)}</strong></div>
+                  {r.notified && <div className={styles.notif}>🟢 Книга свободна — возьмите её сейчас!</div>}
+                </div>
+                <button className={`${styles.btn} ${styles.btnGhost}`} onClick={() => handleCancelRes(r.book_id, r.title)}>
+                  Отменить
+                </button>
+              </div>
+            ))}
+          </div>
+        )
+      )}
+    </div>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\pages\MyBooksPage.module.css
+============================================================
+
+/* MyBooksPage.module.css */
+.page  { max-width: 900px; margin: 0 auto; padding: 44px 48px; }
+.head  { margin-bottom: 28px; }
+.title { font-family: var(--serif); font-size: 2.2rem; font-weight: 400; }
+.tabBar { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 28px; gap: 4px; }
+.tab { padding: 10px 18px; border: none; background: none; font-size: .83rem; font-weight: 500; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; transition: all .2s; display: flex; align-items: center; gap: 7px; }
+.tab:hover { color: var(--ink); }
+.tabAct { color: var(--ink); border-bottom-color: var(--ink); }
+.tabCount { background: var(--cream); border-radius: 10px; padding: 1px 7px; font-size: .72rem; font-weight: 700; color: var(--muted); }
+.list  { display: flex; flex-direction: column; gap: 14px; }
+.row   { background: white; border: 1px solid var(--border); border-radius: 11px; display: flex; align-items: center; gap: 18px; padding: 18px 22px; transition: box-shadow .2s; animation: slideRight .35s ease both; }
+.row:hover { box-shadow: var(--shadow); }
+.emoji { font-size: 2.4rem; flex-shrink: 0; }
+.info  { flex: 1; }
+.rTitle  { font-family: var(--serif); font-size: 1.1rem; font-weight: 500; margin-bottom: 2px; }
+.rAuthor { font-size: .8rem; color: var(--muted); margin-bottom: 6px; }
+.rDates  { font-size: .78rem; color: var(--muted); }
+.notif   { font-size: .8rem; color: var(--forest); font-weight: 600; margin-top: 5px; }
+.pill    { padding: 4px 12px; border-radius: 14px; font-size: .76rem; font-weight: 600; white-space: nowrap; flex-shrink: 0; }
+.pillOk   { background: var(--forest-l); color: var(--forest); }
+.pillWarn { background: #fff3cd; color: #856404; }
+.pillOver { background: #fde8d0; color: var(--rust); }
+.pillDone { background: var(--cream); color: var(--muted); }
+.btn   { padding: 7px 15px; border-radius: 7px; border: none; font-size: .8rem; font-weight: 500; cursor: pointer; transition: all .2s; flex-shrink: 0; }
+.btnForest { background: var(--forest); color: white; } .btnForest:hover { background: #162c23; }
+.btnGhost  { background: none; border: 1px solid var(--border); color: var(--muted); } .btnGhost:hover { border-color: var(--ink); color: var(--ink); }
+.empty { text-align: center; padding: 70px 24px; }
+.empty div:first-child { font-size: 3rem; margin-bottom: 16px; opacity: .35; }
+.empty h3 { font-family: var(--serif); font-size: 1.5rem; font-weight: 400; margin-bottom: 7px; }
+.empty p  { color: var(--muted); font-size: .88rem; margin-bottom: 20px; }
+.emptyBtn { background: var(--ink); color: var(--paper); border: none; padding: 10px 24px; border-radius: 7px; cursor: pointer; font-size: .88rem; font-weight: 500; }
+@media (max-width: 768px) { .page { padding: 28px 18px; } }
+
+
+============================================================
+ФАЙЛ: .\frontend\src\pages\ProfilePage.jsx
+============================================================
+
+import { useAuth } from '../context/AuthContext.jsx'
+import { useRentals } from '../hooks/useRentals.js'
+import { useWishlist } from '../hooks/useWishlist.js'
+import { fmtDate } from '../utils/dateUtils.js'
+import { ACHIEVEMENTS } from '../utils/bookUtils.js'
+import styles from './ProfilePage.module.css'
+
+export default function ProfilePage() {
+  const { user }          = useAuth()
+  const { active, history } = useRentals()
+  const { items: wishlist } = useWishlist()
+
+  // Client-side stats (reviews & donations tracked server-side in real app)
+  const stats = {
+    totalRentals: active.length + history.length,
+    returned:     history.length,
+    active:       active.length,
+    reviews:      0,   // would come from /api/auth/me stats in prod
+    wishlisted:   wishlist.length,
+    donated:      0,
+  }
+
+  const earned = ACHIEVEMENTS.filter(a => a.check(stats))
+
+  return (
+    <div className={styles.page}>
+      <h1 className={styles.pageTitle}>Профиль</h1>
+
+      {/* Profile Card */}
+      <div className={styles.card}>
+        <div className={styles.avatar}>{user.name[0].toUpperCase()}</div>
+        <div className={styles.name}>{user.name}</div>
+        <div className={styles.email}>{user.email}</div>
+
+        <div className={styles.statsGrid}>
+          <div className={styles.stat}><div className={styles.sn}>{stats.active}</div><div className={styles.sl}>На руках</div></div>
+          <div className={styles.stat}><div className={styles.sn}>{stats.returned}</div><div className={styles.sl}>Прочитано</div></div>
+          <div className={styles.stat}><div className={styles.sn}>{wishlist.length}</div><div className={styles.sl}>В избранном</div></div>
+        </div>
+
+        <div className={styles.joined}>Читатель с {fmtDate(user.created_at ?? user.joinedAt ?? new Date())}</div>
+      </div>
+
+      {/* Achievements */}
+      <div className={styles.section}>
+        <div className={styles.sectionHead}>
+          <h2 className={styles.sectionTitle}>Достижения</h2>
+          <span className={styles.sectionCount}>{earned.length}/{ACHIEVEMENTS.length} получено</span>
+        </div>
+
+        <div className={styles.achGrid}>
+          {ACHIEVEMENTS.map(a => {
+            const isEarned = a.check(stats)
+            return (
+              <div key={a.id} className={`${styles.ach} ${isEarned ? styles.achEarned : styles.achLocked}`}>
+                <div className={styles.achIcon}>{a.icon}</div>
+                <div className={styles.achLabel}>{a.label}</div>
+                <div className={styles.achDesc}>{a.desc}</div>
+                {isEarned && <div className={styles.achCheck}>✓ Получено</div>}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\pages\ProfilePage.module.css
+============================================================
+
+.page      { max-width: 760px; margin: 0 auto; padding: 44px 48px; }
+.pageTitle { font-family: var(--serif); font-size: 2.2rem; font-weight: 400; margin-bottom: 28px; }
+.card      { background: white; border: 1px solid var(--border); border-radius: 14px; padding: 34px; margin-bottom: 36px; animation: fadeUp .4s ease; }
+.avatar    { width: 68px; height: 68px; border-radius: 50%; background: var(--ink); display: flex; align-items: center; justify-content: center; font-family: var(--serif); font-size: 1.9rem; color: var(--paper); margin-bottom: 18px; }
+.name      { font-family: var(--serif); font-size: 1.9rem; font-weight: 400; margin-bottom: 3px; }
+.email     { color: var(--muted); font-size: .86rem; margin-bottom: 24px; }
+.statsGrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 24px; }
+.stat      { background: var(--cream); border-radius: 9px; padding: 14px; text-align: center; }
+.sn        { font-family: var(--serif); font-size: 1.75rem; font-weight: 500; }
+.sl        { font-size: .68rem; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); margin-top: 2px; }
+.joined    { color: var(--muted); font-size: .78rem; }
+.section   { animation: fadeUp .45s ease both; }
+.sectionHead { display: flex; align-items: baseline; gap: 14px; margin-bottom: 18px; }
+.sectionTitle{ font-family: var(--serif); font-size: 1.6rem; font-weight: 400; }
+.sectionCount{ font-size: .8rem; color: var(--muted); }
+.achGrid   { display: grid; grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); gap: 12px; }
+.ach       { border-radius: 11px; padding: 16px; text-align: center; transition: transform .2s; }
+.ach:hover { transform: translateY(-2px); }
+.achEarned { background: linear-gradient(135deg, var(--gold-pale), #fff8e8); border: 1px solid var(--gold-l); }
+.achLocked { background: var(--cream); border: 1px dashed var(--border); opacity: .55; }
+.achIcon   { font-size: 2rem; margin-bottom: 8px; }
+.achLabel  { font-family: var(--serif); font-size: .88rem; font-weight: 500; margin-bottom: 4px; line-height: 1.25; }
+.achDesc   { font-size: .7rem; color: var(--muted); line-height: 1.4; }
+.achCheck  { color: var(--forest); font-size: .74rem; margin-top: 5px; font-weight: 700; }
+@media (max-width: 768px) { .page { padding: 28px 18px; } .statsGrid { grid-template-columns: repeat(3,1fr); } }
+
+
+============================================================
+ФАЙЛ: .\frontend\src\pages\WishlistPage.jsx
+============================================================
+
+import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useWishlist } from '../hooks/useWishlist.js'
+import { useToast } from '../context/ToastContext.jsx'
+import { avgRating } from '../utils/dateUtils.js'
+import styles from './WishlistPage.module.css'
+
+export default function WishlistPage() {
+  const navigate      = useNavigate()
+  const { showToast } = useToast()
+  const { items, toggle } = useWishlist()
+
+  const handleRemove = async (bookId, title) => {
+    await toggle(bookId)
+    showToast(`«${title}» удалена из избранного`, 'i')
+  }
+
+  return (
+    <div className={styles.page}>
+      <div className={styles.head}>
+        <h1 className={styles.title}>Избранное</h1>
+        <span className={styles.count}>{items.length} книг</span>
+      </div>
+
+      {items.length === 0 ? (
+        <div className={styles.empty}>
+          <div>🔖</div>
+          <h3>Избранное пусто</h3>
+          <p>Нажимайте 🤍 на карточках книг, чтобы сохранить</p>
+          <button className={styles.emptyBtn} onClick={() => navigate('/')}>В каталог</button>
+        </div>
+      ) : (
+        <div className={styles.list}>
+          {items.map((w, i) => (
+            <div className={styles.row} key={w.id} style={{ animationDelay: `${i * .05}s` }}>
+              <div className={styles.emoji}>{w.cover_emoji}</div>
+              <div className={styles.info}>
+                <div className={styles.rTitle}>{w.title}</div>
+                <div className={styles.rAuthor}>{w.author} · {w.year}</div>
+                {w.avg_rating && (
+                  <div className={styles.rating}>{'★'.repeat(Math.round(w.avg_rating))} {w.avg_rating}</div>
+                )}
+              </div>
+              <span className={`${styles.badge} ${w.available ? styles.badgeOk : styles.badgeTaken}`}>
+                {w.available ? 'Свободна' : 'Занята'}
+              </span>
+              <button className={styles.trashBtn} onClick={() => handleRemove(w.book_id, w.title)} title="Удалить из избранного">🗑</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+============================================================
+ФАЙЛ: .\frontend\src\pages\WishlistPage.module.css
+============================================================
+
+.page  { max-width: 900px; margin: 0 auto; padding: 44px 48px; }
+.head  { display: flex; align-items: baseline; gap: 14px; margin-bottom: 30px; }
+.title { font-family: var(--serif); font-size: 2.2rem; font-weight: 400; }
+.count { font-size: .8rem; color: var(--muted); letter-spacing: .05em; }
+.list  { display: flex; flex-direction: column; gap: 13px; }
+.row   { background: white; border: 1px solid var(--border); border-radius: 11px; display: flex; align-items: center; gap: 16px; padding: 16px 20px; transition: box-shadow .2s; animation: slideRight .3s ease both; }
+.row:hover { box-shadow: var(--shadow); }
+.emoji { font-size: 2.2rem; flex-shrink: 0; }
+.info  { flex: 1; }
+.rTitle  { font-family: var(--serif); font-size: 1.05rem; font-weight: 500; margin-bottom: 2px; }
+.rAuthor { font-size: .8rem; color: var(--muted); margin-bottom: 4px; }
+.rating  { color: var(--gold); font-size: .78rem; }
+.badge   { padding: 3px 10px; border-radius: 14px; font-size: .7rem; font-weight: 700; flex-shrink: 0; }
+.badgeOk   { background: var(--forest-l); color: var(--forest); }
+.badgeTaken{ background: #fde8d0; color: var(--rust); }
+.trashBtn  { background: none; border: none; font-size: 1.1rem; cursor: pointer; padding: 4px 8px; border-radius: 6px; transition: background .2s; }
+.trashBtn:hover { background: var(--cream); }
+.empty { text-align: center; padding: 70px 24px; }
+.empty div:first-child { font-size: 3rem; margin-bottom: 16px; opacity: .35; }
+.empty h3 { font-family: var(--serif); font-size: 1.5rem; font-weight: 400; margin-bottom: 7px; }
+.empty p  { color: var(--muted); font-size: .88rem; margin-bottom: 20px; }
+.emptyBtn { background: var(--ink); color: var(--paper); border: none; padding: 10px 24px; border-radius: 7px; cursor: pointer; font-size: .88rem; font-weight: 500; }
+@media (max-width: 768px) { .page { padding: 28px 18px; } }
+
+
+============================================================
+ФАЙЛ: .\frontend\src\utils\bookUtils.js
+============================================================
+
+export const GENRE_EMOJI = {
+  'Роман':    '📗',
+  'Классика': '📘',
+  'Эпопея':   '🏛️',
+  'Поэзия':   '🎶',
+  'Сатира':   '😄',
+  'Пьеса':    '🎭',
+  'Поэма':    '📜',
+  'default':  '📚',
+}
+
+export const bookEmoji = (genre) => GENRE_EMOJI[genre] ?? GENRE_EMOJI.default
+
+export const GENRES = ['Все', 'Роман', 'Классика', 'Эпопея', 'Поэзия', 'Сатира', 'Пьеса', 'Поэма']
+
+export const ACHIEVEMENTS = [
+  { id: 'first_read',  icon: '🌱', label: 'Первая страница',  desc: 'Взяли первую книгу',            check: (s) => s.totalRentals >= 1  },
+  { id: 'bookworm',    icon: '🐛', label: 'Книжный червь',    desc: 'Прочитали 5 книг',               check: (s) => s.returned    >= 5  },
+  { id: 'bibliophile', icon: '🦋', label: 'Библиофил',        desc: 'Прочитали 10 книг',              check: (s) => s.returned    >= 10 },
+  { id: 'critic',      icon: '⭐', label: 'Критик',           desc: 'Оставили 3 отзыва',              check: (s) => s.reviews     >= 3  },
+  { id: 'crosser',     icon: '📦', label: 'Буккроссер',       desc: 'Пожертвовали книгу библиотеке',  check: (s) => s.donated     >= 1  },
+  { id: 'collector',   icon: '🔖', label: 'Коллекционер',     desc: 'Добавили 5 книг в избранное',    check: (s) => s.wishlisted  >= 5  },
+  { id: 'curator',     icon: '🏛️', label: 'Куратор',          desc: 'Пожертвовали 3 книги',           check: (s) => s.donated     >= 3  },
+  { id: 'reviewer',    icon: '✍️', label: 'Рецензент',        desc: 'Оставили 10 отзывов',            check: (s) => s.reviews     >= 10 },
+]
+
+
+============================================================
+ФАЙЛ: .\frontend\src\utils\dateUtils.js
+============================================================
+
+export const fmtDate = (d) =>
+  new Date(d).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' })
+
+export const daysLeft = (due) =>
+  Math.ceil((new Date(due) - new Date()) / 86_400_000)
+
+export const starsStr = (n) => '★'.repeat(n) + '☆'.repeat(5 - n)
+
+export const avgRating = (reviews = []) => {
+  if (!reviews.length) return null
+  return (reviews.reduce((a, r) => a + r.rating, 0) / reviews.length).toFixed(1)
+}

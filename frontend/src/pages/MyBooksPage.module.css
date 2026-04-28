@@ -1,0 +1,22 @@
+/* MyBooksPage.module.css */
+.page  { max-width: 900px; margin: 0 auto; padding: 44px 48px; }
+.head  { margin-bottom: 28px; }
+.title { font-family: var(--serif); font-size: 2.2rem; font-weight: 400; }
+.list  { display: flex; flex-direction: column; gap: 14px; }
+.row   { background: white; border: 1px solid var(--border); border-radius: 11px; display: flex; align-items: center; gap: 18px; padding: 18px 22px; transition: box-shadow .2s; animation: slideRight .35s ease both; }
+.row:hover { box-shadow: var(--shadow); }
+.cover { width: 48px; height: 66px; border-radius: 9px; overflow: hidden; flex-shrink: 0; display: grid; place-items: center; background: var(--cream); border: 1px solid var(--border); }
+.coverImg { width: 100%; height: 100%; object-fit: cover; display: block; }
+.coverEmoji { font-size: 1.9rem; }
+.info  { flex: 1; }
+.rTitle  { font-family: var(--serif); font-size: 1.1rem; font-weight: 500; margin-bottom: 2px; }
+.rAuthor { font-size: .8rem; color: var(--muted); margin-bottom: 6px; }
+.rDates  { font-size: .78rem; color: var(--muted); }
+.pill    { padding: 4px 12px; border-radius: 14px; font-size: .76rem; font-weight: 600; white-space: nowrap; flex-shrink: 0; }
+.pillDone { background: var(--cream); color: var(--muted); }
+.empty { text-align: center; padding: 70px 24px; }
+.empty div:first-child { font-size: 3rem; margin-bottom: 16px; opacity: .35; }
+.empty h3 { font-family: var(--serif); font-size: 1.5rem; font-weight: 400; margin-bottom: 7px; }
+.empty p  { color: var(--muted); font-size: .88rem; margin-bottom: 20px; }
+.emptyBtn { background: var(--ink); color: var(--paper); border: none; padding: 10px 24px; border-radius: 7px; cursor: pointer; font-size: .88rem; font-weight: 500; }
+@media (max-width: 768px) { .page { padding: 28px 18px; } }
