@@ -1,4 +1,4 @@
-.row   { display: flex; align-items: center; gap: 4px; margin-bottom: 14px; }
+.row   { display: flex; align-items: center; gap: 4px; margin-bottom: 14px; flex-wrap: wrap; }
 .star  { background: none; border: none; font-size: 1.6rem; cursor: pointer; transition: transform .15s; line-height: 1; padding: 0 2px; }
 .star:hover { transform: scale(1.15); }
 .label { font-size: .83rem; color: var(--muted); margin-left: 6px; }

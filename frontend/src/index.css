@@ -40,6 +40,22 @@ body {
   color: var(--ink);
   min-height: 100vh;
   -webkit-font-smoothing: antialiased;
+  overflow-x: clip;
+}
+
+#root {
+  min-width: 0;
+}
+
+img,
+video,
+svg {
+  max-width: 100%;
+  height: auto;
+}
+
+canvas {
+  max-width: 100%;
 }
 
 a {

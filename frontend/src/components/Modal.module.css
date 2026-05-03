@@ -6,7 +6,8 @@
 }
 .modal {
   background: white; border-radius: var(--radius-lg); padding: 38px;
-  width: 100%; position: relative; max-height: 92vh; overflow-y: auto;
+  width: 100%; min-width: 0; position: relative; max-height: 92vh; overflow-y: auto;
+  overflow-wrap: break-word;
   animation: scaleIn .25s ease;
 }
 .close {
@@ -16,3 +17,13 @@
   display: flex; align-items: center; justify-content: center; transition: background .2s;
 }
 .close:hover { background: var(--cream); }
+
+@media (max-width: 520px) {
+  .overlay { padding: 12px; align-items: flex-end; }
+  .modal {
+    padding: 22px 18px 20px;
+    max-height: 96vh;
+    border-radius: 16px 16px 0 0;
+  }
+  .close { top: 10px; right: 10px; }
+}

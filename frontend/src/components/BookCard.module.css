@@ -149,6 +149,12 @@
   font-size: 0.8rem;
   color: rgba(255,255,255,0.8);
   margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow-wrap: anywhere;
 }
 .genre {
   font-size: 0.7rem;
@@ -156,6 +162,9 @@
   letter-spacing: 0.05em;
   color: var(--gold-l);
   margin-bottom: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .rating {
   display: flex;
@@ -179,4 +188,15 @@
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+/* Touch devices: hover panels are unusable — keep a readable preview visible */
+@media (hover: none) {
+  .card:hover { transform: none; box-shadow: none; border-color: var(--border); }
+  .infoPanel {
+    transform: translateY(0);
+    background: rgba(0, 0, 0, 0.62);
+  }
+  .moreInfo { opacity: 1; }
+  .title { white-space: normal; -webkit-line-clamp: 2; display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; }
 }

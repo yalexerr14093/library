@@ -86,3 +86,13 @@
 .metricSep { color: var(--muted); }
 .metricSub { color: var(--muted); }
 
+@media (max-width: 1024px) {
+  .wrap { position: static; }
+}
+
+@media (max-width: 560px) {
+  .name, .meta { white-space: normal; overflow-wrap: break-word; }
+  .metrics { flex-wrap: wrap; row-gap: 2px; }
+  .metricSep { display: none; }
+}
+

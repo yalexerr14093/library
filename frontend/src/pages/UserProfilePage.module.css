@@ -1,39 +1,44 @@
-.page { max-width: 900px; margin: 0 auto; padding: 36px 48px; }
+.page { max-width: 900px; margin: 0 auto; padding: 36px 48px; min-width: 0; }
 .loading { padding: 70px 24px; text-align: center; color: var(--muted); }
 .back { background: none; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; cursor: pointer; color: var(--muted); margin-bottom: 18px; }
 .back:hover { border-color: var(--ink); color: var(--ink); }
 
 .card { background: white; border: 1px solid var(--border); border-radius: 14px; padding: 28px; margin-bottom: 22px; }
 .avatar { width: 64px; height: 64px; border-radius: 50%; background: var(--ink); display: flex; align-items: center; justify-content: center; font-family: var(--serif); font-size: 1.8rem; color: var(--paper); margin-bottom: 14px; }
-.name { font-family: var(--serif); font-size: 1.8rem; font-weight: 400; }
-.meta { color: var(--muted); font-size: .82rem; margin-top: 4px; }
+.name { font-family: var(--serif); font-size: 1.8rem; font-weight: 400; overflow-wrap: break-word; }
+.meta { color: var(--muted); font-size: .82rem; margin-top: 4px; overflow-wrap: break-word; }
 .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-top: 18px; }
-.stat { background: var(--cream); border-radius: 10px; padding: 14px; text-align: center; }
+.stat { background: var(--cream); border-radius: 10px; padding: 14px; text-align: center; min-width: 0; }
 .sn { font-family: var(--serif); font-size: 1.7rem; font-weight: 500; }
 .sl { font-size: .68rem; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); margin-top: 2px; }
 
 .section { margin-top: 18px; }
-.sectionTitle { font-family: var(--serif); font-size: 1.4rem; font-weight: 400; margin: 16px 0 12px; }
+.sectionTitle { font-family: var(--serif); font-size: 1.4rem; font-weight: 400; margin: 16px 0 12px; overflow-wrap: break-word; }
 .empty { color: var(--muted); padding: 14px 2px; }
 
 .list { display: flex; flex-direction: column; gap: 12px; }
-.row { background: white; border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px; display: flex; gap: 16px; align-items: center; }
+.row { background: white; border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px; display: flex; gap: 16px; align-items: center; min-width: 0; }
 .emoji { font-size: 2.1rem; flex-shrink: 0; }
-.info { flex: 1; }
-.rTitle { font-family: var(--serif); font-size: 1.05rem; font-weight: 500; margin-bottom: 2px; }
-.rAuthor { font-size: .8rem; color: var(--muted); }
-.rRight { text-align: right; }
+.info { flex: 1; min-width: 0; }
+.rTitle { font-family: var(--serif); font-size: 1.05rem; font-weight: 500; margin-bottom: 2px; overflow-wrap: break-word; }
+.rAuthor { font-size: .8rem; color: var(--muted); overflow-wrap: break-word; }
+.rRight { text-align: right; min-width: 0; }
 .stars { color: var(--gold); font-size: .85rem; letter-spacing: 1px; }
 .date { color: var(--muted); font-size: .75rem; margin-top: 2px; }
 
 .reviewList { display: flex; flex-direction: column; gap: 10px; }
 .reviewCard { background: var(--cream); border-radius: 12px; padding: 14px; border: 1px solid var(--border); }
-.rvTop { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
-.bookLink { background: none; border: none; padding: 0; font-weight: 600; cursor: pointer; text-align: left; color: var(--ink); }
+.rvTop { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
+.bookLink { background: none; border: none; padding: 0; font-weight: 600; cursor: pointer; text-align: left; color: var(--ink); max-width: 100%; overflow-wrap: break-word; }
 .bookLink:hover { text-decoration: underline; }
-.rvStars { color: var(--gold); font-size: .85rem; letter-spacing: 1px; white-space: nowrap; }
-.rvText { font-size: .86rem; color: #4a4540; line-height: 1.6; }
+.rvStars { color: var(--gold); font-size: .85rem; letter-spacing: 1px; flex-shrink: 0; white-space: nowrap; }
+.rvText { font-size: .86rem; color: #4a4540; line-height: 1.6; overflow-wrap: break-word; }
 .rvMeta { margin-top: 6px; font-size: .74rem; color: var(--muted); }
 
-@media (max-width: 768px) { .page { padding: 28px 18px; } }
+@media (max-width: 768px) {
+  .page { padding: 28px 18px; }
+  .row { flex-direction: column; align-items: stretch; }
+  .rRight { text-align: left; width: 100%; display: flex; justify-content: space-between; gap: 10px; }
+  .rvTop { flex-direction: column; align-items: flex-start; }
+}
 

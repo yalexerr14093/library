@@ -1,4 +1,4 @@
-.title  { font-family: var(--serif); font-size: 1.8rem; font-weight: 400; margin-bottom: 6px; }
+.title  { font-family: var(--serif); font-size: 1.8rem; font-weight: 400; margin-bottom: 6px; overflow-wrap: break-word; }
 .sub    { color: var(--muted); font-size: .87rem; margin-bottom: 26px; line-height: 1.6; }
 .fg     { margin-bottom: 16px; }
 .label  { display: block; font-size: .74rem; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }

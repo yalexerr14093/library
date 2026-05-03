@@ -4,7 +4,11 @@
   padding: 13px 22px; border-radius: 9px; font-size: .86rem; z-index: 500;
   animation: fadeUp .3s ease; box-shadow: var(--shadow-lg);
   display: flex; align-items: center; gap: 9px;
-  min-width: 260px; max-width: 420px;
+  box-sizing: border-box;
+  width: min(420px, calc(100vw - 24px));
+  min-width: 0;
+  max-width: calc(100vw - 24px);
+  overflow-wrap: break-word;
 }
 .icon { font-size: .9rem; }
 .s .icon { color: #4caf50; }

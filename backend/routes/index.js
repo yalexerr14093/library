@@ -5,7 +5,7 @@ const requireRole = require("../middleware/requireRole");
 
 // Для проверки «сервер поднялся» (CI, скрипты, ручной дымовой тест)
 router.get("/health", (req, res) => {
-  res.json({ ok: true, service: "biblioteka-api" });
+  res.json({ ok: true, service: "knizhnaya-polka-api" });
 });
 
 const AuthController    = require("../controllers/AuthController");

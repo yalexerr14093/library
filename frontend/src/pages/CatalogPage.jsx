@@ -167,7 +167,7 @@ export default function CatalogPage() {
       <div className={styles.hero}>
         <div className={styles.heroContent}>
           <div className={styles.heroInner}>
-            <div className={styles.pill}>✦ Городская библиотека</div>
+            <div className={styles.pill}>✦ Книжная полка</div>
             <h1 className={styles.h1}>Читайте больше,<br /><em>думайте глубже</em></h1>
             <p className={styles.lead}>Читайте онлайн, оставляйте отзывы и сохраняйте книги в избранное.</p>
             <div className={styles.stats}>

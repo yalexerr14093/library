@@ -20,9 +20,41 @@ function closeHttpServer(server) {
   });
 }
 
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+function parseFrontendOrigins() {
+  const raw = process.env.FRONTEND_URL || "http://localhost:5173";
+  return raw
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+}
 
-app.use(cors({ origin: FRONTEND_URL, credentials: true }));
+const FRONTEND_ORIGINS = new Set(parseFrontendOrigins());
+const PRIMARY_FRONTEND = [...FRONTEND_ORIGINS][0] || "http://localhost:5173";
+
+const ALLOW_LOCALHOST_CORS =
+  process.env.NODE_ENV !== "production" || process.env.ALLOW_LOCALHOST_CORS === "true";
+
+function isLocalhostOrigin(origin) {
+  try {
+    const u = new URL(origin);
+    return u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1");
+  } catch {
+    return false;
+  }
+}
+
+app.use(
+  cors({
+    credentials: true,
+    origin(origin, callback) {
+      // non-browser clients / same-origin
+      if (!origin) return callback(null, true);
+      if (FRONTEND_ORIGINS.has(origin)) return callback(null, origin);
+      if (ALLOW_LOCALHOST_CORS && isLocalhostOrigin(origin)) return callback(null, origin);
+      return callback(null, false);
+    },
+  })
+);
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
@@ -42,11 +74,11 @@ app.get("/", (req, res) => {
   const wantsHtml = (req.get("accept") || "").includes("text/html");
   if (wantsHtml) {
     return res.type("html").send(`<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8"><title>Biblioteka API</title></head>
+<html lang="ru"><head><meta charset="utf-8"><title>Книжная полка — API</title></head>
 <body style="font-family:system-ui,sans-serif;max-width:42rem;margin:2rem auto;line-height:1.5">
-  <h1>Biblioteka API</h1>
+  <h1>Книжная полка — API</h1>
   <p>Это сервер приложения (REST). Страница каталога — на фронтенде:</p>
-  <p><a href="${FRONTEND_URL}">${FRONTEND_URL}</a></p>
+  <p><a href="${PRIMARY_FRONTEND}">${PRIMARY_FRONTEND}</a></p>
   <p>Проверка API: <a href="/api/health">/api/health</a> · <a href="/api/books/genres">/api/books/genres</a></p>
 </body></html>`);
   }
@@ -54,7 +86,7 @@ app.get("/", (req, res) => {
     ok: true,
     kind: "api",
     hint: "Интерфейс открывайте на URL фронтенда (см. frontend).",
-    frontend: FRONTEND_URL,
+    frontend: PRIMARY_FRONTEND,
     endpoints: ["/api/health", "/api/books", "/api/books/genres"],
   });
 });
@@ -100,7 +132,7 @@ async function boot() {
           .listen(PORT)
           .once("error", reject)
           .once("listening", () => {
-            console.log(`📚 Biblioteka API → http://localhost:${PORT}`);
+            console.log(`📚 Книжная полка API → http://localhost:${PORT}`);
             startCoverBackfillLoop();
             resolve(serverInstance);
           });

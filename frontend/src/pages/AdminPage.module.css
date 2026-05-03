@@ -2,6 +2,7 @@
   max-width: 1200px;
   margin: 0 auto;
   padding: 40px 24px;
+  min-width: 0;
 }
 
 .title {
@@ -9,6 +10,7 @@
   font-size: 2.5rem;
   margin-bottom: 32px;
   font-weight: 400;
+  overflow-wrap: break-word;
 }
 
 .titleRow {
@@ -16,6 +18,8 @@
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 
 .linksRow {
@@ -42,6 +46,7 @@
   display: grid;
   grid-template-columns: 1fr 2fr;
   gap: 40px;
+  min-width: 0;
 }
 
 .formSection, .listSection {
@@ -49,6 +54,7 @@
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 24px;
+  min-width: 0;
 }
 
 .formSection h2, .listSection h2 {
@@ -153,6 +159,7 @@
   border: 1px solid var(--border);
   border-radius: 8px;
   transition: box-shadow 0.2s;
+  min-width: 0;
 }
 .bookItem:hover {
   box-shadow: var(--shadow);
@@ -177,21 +184,25 @@
 
 .bookInfo {
   flex: 1;
+  min-width: 0;
 }
 .bookTitle {
   font-family: var(--serif);
   font-weight: 500;
   font-size: 1rem;
   margin-bottom: 2px;
+  overflow-wrap: break-word;
 }
 .bookAuthor {
   font-size: 0.85rem;
   color: var(--muted);
+  overflow-wrap: break-word;
 }
 .bookMeta {
   font-size: 0.75rem;
   color: var(--rust);
   margin-top: 2px;
+  overflow-wrap: break-word;
 }
 
 .bookActions {
@@ -223,7 +234,21 @@
 }
 
 @media (max-width: 768px) {
+  .container { padding: 28px 16px; }
+  .title { font-size: 2rem; margin-bottom: 18px; }
+  .titleRow { flex-direction: column; align-items: stretch; }
+  .linksRow { flex-wrap: wrap; justify-content: flex-start; }
   .content {
     grid-template-columns: 1fr;
+    gap: 18px;
   }
+  .row { grid-template-columns: 1fr; }
+  .bookItem { align-items: flex-start; }
+  .bookActions { margin-left: auto; }
+}
+
+@media (max-width: 520px) {
+  .linkBtn { width: 100%; text-align: center; }
+  .bookItem { flex-direction: column; align-items: stretch; }
+  .bookActions { width: 100%; justify-content: flex-end; }
 }
